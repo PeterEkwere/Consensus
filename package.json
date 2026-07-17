@@ -1,0 +1,13 @@
+{
+  "name": "consensus-reaper",
+  "version": "1.0.0",
+  "description": "Consensus Reaper crypto market structure alert bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "scan": "node bot.js --dry-run"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

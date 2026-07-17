@@ -1,0 +1,6 @@
+.env
+alerts.json
+signals.json
+state.json
+node_modules/
+npm-debug.log*
