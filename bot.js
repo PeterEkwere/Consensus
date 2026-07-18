@@ -1,35 +1,34 @@
 /**
  * Consensus Reaper
  *
- * Lean crypto market-structure alert bot.
+ * Lean crypto market-structure alert bot for MAJOR exchange pairs.
  *
- * Data sources:
- * - GeckoTerminal public API for trending pools and OHLCV candles.
- * - No wallet, no private key, no trading, no paid API key.
+ * Data sources (free, official, no API key, no wallet, no trading):
+ * - Binance Spot   : https://api.binance.com/api/v3
+ * - Binance Futures: https://fapi.binance.com/fapi/v1  (USDⓈ-M perpetuals)
+ * - Bybit v5       : https://api.bybit.com/v5/market   (fallback if Binance is geo-blocked)
+ *
+ * Signals use a multi-timeframe consensus: the 15m chart is the primary setup
+ * timeframe, the 1h chart gates the trade direction, and the 5m chart adds a
+ * momentum trigger. Pairs are shown as TradingView symbols with chart links.
  *
  * Commands:
- *   /start, /help       - command list
- *   /id                 - show current chat id
- *   /activate           - owner only, add this chat/group to alerts
- *   /deactivate         - owner only, remove this chat/group from alerts
- *   /status             - show runtime config
- *   /scan               - owner only, run a manual scan now
- *   /testalert          - owner only, send a sample alert to this chat
- *   /pause, /resume     - owner only, pause/resume auto alerts
- *   /networks           - show scanned networks
- *   /addnetwork <id>    - owner only, add GeckoTerminal network id
- *   /removenetwork <id> - owner only, remove network id
- *   /watch <network> <pool>
- *   /watch <geckoterminal pool url>
- *   /watch <dexscreener pool url>
- *   /unwatch <network> <pool>
- *   /watchlist
- *   /threshold <score>  - owner only, set alert score threshold
- *   /filters            - show scan filters
- *   /liquidity <usd>    - owner only, set minimum liquidity
- *   /volume <usd>       - owner only, set minimum 1h volume
- *   /txns <count>       - owner only, set minimum 1h txns
- *   /pools <count>      - owner only, set max pools per network
+ *   /start, /help        - command list
+ *   /id                  - show current chat id
+ *   /activate            - owner only, add this chat/group to alerts
+ *   /deactivate          - owner only, remove this chat/group from alerts
+ *   /status              - show runtime config
+ *   /scan                - owner only, run a manual scan now
+ *   /testalert           - owner only, send a sample alert to this chat
+ *   /pause, /resume      - owner only, pause/resume auto alerts
+ *   /pairs               - list tracked pairs
+ *   /addpair BTCUSDT           - owner only, add a spot pair
+ *   /addpair BTCUSDT futures   - owner only, add a futures (perp) pair
+ *   /addpair BINANCE:BTCUSDT.P - owner only, TradingView form also accepted
+ *   /removepair BTCUSDT  - owner only, remove a pair
+ *   /resetpairs          - owner only, restore the default major pairs
+ *   /exchange binance|bybit - owner only, set the primary data source
+ *   /threshold <score>   - owner only, set alert score threshold
  */
 
 const fs = require("fs");
@@ -44,45 +43,48 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OWNER_ID = 7059352737;
 const DEFAULT_OWNER_CHAT_ID = 7059352737;
 
-const GECKO_BASE = "https://api.geckoterminal.com/api/v2";
+const BINANCE_SPOT = "https://api.binance.com/api/v3";
+const BINANCE_FUT = "https://fapi.binance.com/fapi/v1";
+const BYBIT_BASE = "https://api.bybit.com/v5/market";
+
 const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
 const ALERTS_FILE = path.join(__dirname, "alerts.json");
 
+// Default universe: major, liquid pairs. Majors are tracked on futures so that
+// SHORT setups are actionable and TradingView links open the perpetual chart.
+const DEFAULT_PAIRS = [
+  "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+  "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "TRXUSDT",
+  "TONUSDT", "SUIUSDT", "LTCUSDT", "BCHUSDT", "DOTUSDT",
+  "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "UNIUSDT",
+].map((symbol) => makePair(symbol, "futures"));
+
 const DEFAULT_STATE = {
   paused: false,
   alertChatIds: [DEFAULT_OWNER_CHAT_ID],
-  networks: ["solana", "base"],
-  minLiquidityUsd: 25000,
-  minVolumeH1Usd: 5000,
-  minTxH1: 25,
-  maxPoolsPerNetwork: 12,
+  exchange: "binance",        // primary data source: binance | bybit
+  pairs: DEFAULT_PAIRS,
   scanIntervalMinutes: 5,
-  alertThreshold: 72,
-  cooldownMinutes: 45,
-  watchedPools: [],
+  alertThreshold: 65,
+  cooldownMinutes: 30,
+  useHtfGate: true,           // require the 1h trend to agree with the trade side
+  minQuoteVolume24h: 5000000, // skip thin books: 24h quote volume floor (USDT)
   lastAlerts: {},
 };
 
-const NETWORK_LABELS = {
-  solana: "Solana",
-  base: "Base",
-  eth: "Ethereum",
-  ethereum: "Ethereum",
-  bsc: "BNB Chain",
-  arbitrum: "Arbitrum",
-  polygon_pos: "Polygon",
-  optimism: "Optimism",
-  avalanche: "Avalanche",
+const EXCHANGE_LABELS = {
+  binance: "Binance",
+  bybit: "Bybit",
+};
+
+const MARKET_LABELS = {
+  spot: "Spot",
+  futures: "Futures",
 };
 
 let state = loadJson(STATE_FILE, DEFAULT_STATE);
-state = {
-  ...DEFAULT_STATE,
-  ...state,
-  watchedPools: Array.isArray(state.watchedPools) ? state.watchedPools : [],
-  lastAlerts: state.lastAlerts || {},
-};
+state = migrateState(state);
 saveJson(STATE_FILE, state);
 
 const dryRun = process.argv.includes("--dry-run");
@@ -92,6 +94,66 @@ if (!dryRun && !TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 const bot = dryRun ? null : new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: !sendTest });
+
+// ---------------------------------------------------------------------------
+// State + env helpers
+// ---------------------------------------------------------------------------
+
+function makePair(symbol, market) {
+  const api = String(symbol).toUpperCase();
+  const suffix = market === "futures" ? ".P" : "";
+  return {
+    api,
+    market: market === "futures" ? "futures" : "spot",
+    tv: `BINANCE:${api}${suffix}`,
+    label: labelFromSymbol(api),
+  };
+}
+
+function labelFromSymbol(symbol) {
+  const quotes = ["USDT", "USDC", "FDUSD", "USD", "BTC", "ETH"];
+  const sym = String(symbol).toUpperCase();
+  for (const q of quotes) {
+    if (sym.endsWith(q) && sym.length > q.length) {
+      return `${sym.slice(0, sym.length - q.length)} / ${q}`;
+    }
+  }
+  return sym;
+}
+
+function migrateState(loaded) {
+  const next = { ...DEFAULT_STATE, ...(loaded || {}) };
+  // Drop legacy DEX fields if a pre-existing state.json is present.
+  for (const key of ["networks", "minLiquidityUsd", "minVolumeH1Usd", "minTxH1", "maxPoolsPerNetwork", "watchedPools"]) {
+    delete next[key];
+  }
+  // Seed / normalise the pair universe.
+  if (!Array.isArray(next.pairs) || !next.pairs.length) {
+    next.pairs = DEFAULT_PAIRS;
+  } else {
+    next.pairs = next.pairs
+      .map((p) => {
+        if (p && p.api && p.market) {
+          return {
+            api: String(p.api).toUpperCase(),
+            market: p.market === "futures" ? "futures" : "spot",
+            tv: p.tv || makePair(p.api, p.market).tv,
+            label: p.label || labelFromSymbol(p.api),
+          };
+        }
+        if (typeof p === "string") return makePair(p, "futures");
+        return null;
+      })
+      .filter(Boolean);
+  }
+  next.alertChatIds = Array.isArray(next.alertChatIds) && next.alertChatIds.length
+    ? next.alertChatIds
+    : [DEFAULT_OWNER_CHAT_ID];
+  // Cooldown keys changed format with the DEX -> exchange move; start clean.
+  if (!loaded || loaded.watchedPools !== undefined) next.lastAlerts = {};
+  else next.lastAlerts = next.lastAlerts || {};
+  return next;
+}
 
 function loadLocalEnv(file) {
   try {
@@ -147,7 +209,7 @@ function httpGetJson(url, timeoutMs = 15000) {
       timeout: timeoutMs,
       headers: {
         accept: "application/json",
-        "user-agent": "ConsensusReaper/1.0",
+        "user-agent": "ConsensusReaper/2.0",
       },
     }, (res) => {
       let body = "";
@@ -193,6 +255,10 @@ function sendHtml(chatId, text, extra = {}) {
     console.error("Telegram send failed:", err.message);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
 
 function fmtUsd(n) {
   const value = Number(n) || 0;
@@ -243,102 +309,158 @@ function avg(values) {
   return nums.reduce((sum, n) => sum + n, 0) / nums.length;
 }
 
-function networkLabel(network) {
-  return NETWORK_LABELS[network] || network;
+function exchangeLabel(exchange) {
+  return EXCHANGE_LABELS[exchange] || exchange;
 }
 
-function poolUrl(network, poolAddress) {
-  return `https://www.geckoterminal.com/${network}/pools/${poolAddress}`;
+function marketLabel(pair) {
+  return `${exchangeLabel(state.exchange)} ${MARKET_LABELS[pair.market] || pair.market}`;
 }
 
-function txCount(attrs, bucket) {
-  const tx = attrs.transactions && attrs.transactions[bucket];
-  if (!tx) return 0;
-  return Number(tx.buys || 0) + Number(tx.sells || 0);
+function tvChartUrl(tvSymbol) {
+  return `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSymbol)}`;
 }
 
-async function fetchTrendingPools(network) {
-  const url = `${GECKO_BASE}/networks/${encodeURIComponent(network)}/trending_pools?page=1`;
+function parsePairInput(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  const parts = raw.split(/\s+/).filter(Boolean);
+  let token = parts[0].toUpperCase();
+  let market = null;
+
+  // Explicit market word: "/addpair BTCUSDT futures"
+  if (parts[1]) {
+    const m = parts[1].toLowerCase();
+    if (m === "futures" || m === "perp" || m === "perps") market = "futures";
+    if (m === "spot") market = "spot";
+  }
+
+  // TradingView form: "BINANCE:BTCUSDT" or "BINANCE:BTCUSDT.P"
+  const tvMatch = token.match(/^[A-Z]+:([A-Z0-9]+?)(\.P)?$/);
+  if (tvMatch) {
+    token = tvMatch[1];
+    if (tvMatch[2]) market = market || "futures";
+  }
+
+  if (!/^[A-Z0-9]{5,20}$/.test(token)) return null;
+  return makePair(token, market || "spot");
+}
+
+// ---------------------------------------------------------------------------
+// Exchange data adapter (Binance primary, Bybit fallback)
+// ---------------------------------------------------------------------------
+
+const BINANCE_INTERVAL = { "5m": "5m", "15m": "15m", "1h": "1h" };
+const BYBIT_INTERVAL = { "5m": "5", "15m": "15", "1h": "60" };
+
+function normalizeCandles(rows) {
+  return rows
+    .filter((c) => Number.isFinite(c.close) && c.close > 0)
+    .sort((a, b) => a.time - b.time);
+}
+
+// Drops the final, still-forming candle so analysis only sees closed bars.
+function dropOpenCandle(candles) {
+  if (candles.length && candles[candles.length - 1].closeTime > Date.now()) {
+    return candles.slice(0, -1);
+  }
+  return candles;
+}
+
+async function fetchBinanceKlines(market, symbol, frame, limit) {
+  const base = market === "futures" ? BINANCE_FUT : BINANCE_SPOT;
+  const interval = BINANCE_INTERVAL[frame] || "15m";
+  const url = `${base}/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit + 1}`;
   const json = await httpGetJson(url);
-  const rows = Array.isArray(json && json.data) ? json.data : [];
-  return rows.map((row) => {
-    const attrs = row.attributes || {};
-    const address = attrs.address || String(row.id || "").replace(`${network}_`, "");
-    return {
-      id: row.id,
-      network,
-      address,
-      name: attrs.name || "?",
-      priceUsd: Number(attrs.base_token_price_usd || 0),
-      liquidityUsd: Number(attrs.reserve_in_usd || 0),
-      volumeH1Usd: Number(attrs.volume_usd && attrs.volume_usd.h1 || 0),
-      volumeH24Usd: Number(attrs.volume_usd && attrs.volume_usd.h24 || 0),
-      txH1: txCount(attrs, "h1"),
-      txH24: txCount(attrs, "h24"),
-      changeM15: Number(attrs.price_change_percentage && attrs.price_change_percentage.m15 || 0),
-      changeH1: Number(attrs.price_change_percentage && attrs.price_change_percentage.h1 || 0),
-      changeH6: Number(attrs.price_change_percentage && attrs.price_change_percentage.h6 || 0),
-      changeH24: Number(attrs.price_change_percentage && attrs.price_change_percentage.h24 || 0),
-      createdAt: attrs.pool_created_at || null,
-      raw: attrs,
-    };
-  });
-}
-
-async function fetchPool(network, poolAddress) {
-  const url = `${GECKO_BASE}/networks/${encodeURIComponent(network)}/pools/${encodeURIComponent(poolAddress)}`;
-  const json = await httpGetJson(url);
-  const row = json && json.data;
-  if (!row || !row.attributes) return null;
-  const attrs = row.attributes || {};
-  return {
-    id: row.id,
-    network,
-    address: attrs.address || poolAddress,
-    name: attrs.name || "?",
-    priceUsd: Number(attrs.base_token_price_usd || 0),
-    liquidityUsd: Number(attrs.reserve_in_usd || 0),
-    volumeH1Usd: Number(attrs.volume_usd && attrs.volume_usd.h1 || 0),
-    volumeH24Usd: Number(attrs.volume_usd && attrs.volume_usd.h24 || 0),
-    txH1: txCount(attrs, "h1"),
-    txH24: txCount(attrs, "h24"),
-    changeM15: Number(attrs.price_change_percentage && attrs.price_change_percentage.m15 || 0),
-    changeH1: Number(attrs.price_change_percentage && attrs.price_change_percentage.h1 || 0),
-    changeH6: Number(attrs.price_change_percentage && attrs.price_change_percentage.h6 || 0),
-    changeH24: Number(attrs.price_change_percentage && attrs.price_change_percentage.h24 || 0),
-    createdAt: attrs.pool_created_at || null,
-    watched: true,
-    raw: attrs,
-  };
-}
-
-async function fetchOhlcv(network, poolAddress, frame = "15m", limit = 96) {
-  const tf = frameToGecko(frame);
-  const url = `${GECKO_BASE}/networks/${encodeURIComponent(network)}` +
-    `/pools/${encodeURIComponent(poolAddress)}/ohlcv/${tf.unit}` +
-    `?aggregate=${tf.aggregate}&limit=${limit}`;
-  const json = await httpGetJson(url);
-  const list = json && json.data && json.data.attributes && json.data.attributes.ohlcv_list;
-  if (!Array.isArray(list)) return [];
-  return list.map((row) => ({
-    time: Number(row[0]) * 1000,
+  if (!Array.isArray(json)) return null;
+  return normalizeCandles(json.map((row) => ({
+    time: Number(row[0]),
     open: Number(row[1]),
     high: Number(row[2]),
     low: Number(row[3]),
     close: Number(row[4]),
     volume: Number(row[5] || 0),
-  })).filter((c) => Number.isFinite(c.close) && c.close > 0)
-    .sort((a, b) => a.time - b.time);
+    closeTime: Number(row[6]),
+  })));
 }
 
-function frameToGecko(frame) {
-  if (frame === "5m") return { unit: "minute", aggregate: 5 };
-  if (frame === "15m") return { unit: "minute", aggregate: 15 };
-  if (frame === "30m") return { unit: "minute", aggregate: 30 };
-  if (frame === "1h") return { unit: "hour", aggregate: 1 };
-  if (frame === "4h") return { unit: "hour", aggregate: 4 };
-  return { unit: "minute", aggregate: 15 };
+async function fetchBybitKlines(market, symbol, frame, limit) {
+  const category = market === "futures" ? "linear" : "spot";
+  const interval = BYBIT_INTERVAL[frame] || "15";
+  const url = `${BYBIT_BASE}/kline?category=${category}&symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit + 1}`;
+  const json = await httpGetJson(url);
+  const list = json && json.result && json.result.list;
+  if (!Array.isArray(list)) return null;
+  // Bybit returns newest-first; each row: [start, open, high, low, close, volume, turnover].
+  return normalizeCandles(list.map((row) => ({
+    time: Number(row[0]),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5] || 0),
+    closeTime: Number(row[0]) + frameMs(frame),
+  })));
 }
+
+function frameMs(frame) {
+  if (frame === "5m") return 5 * 60 * 1000;
+  if (frame === "1h") return 60 * 60 * 1000;
+  return 15 * 60 * 1000;
+}
+
+async function fetchKlines(pair, frame, limit = 150) {
+  const order = state.exchange === "bybit"
+    ? [fetchBybitKlines, fetchBinanceKlines]
+    : [fetchBinanceKlines, fetchBybitKlines];
+  for (const fetcher of order) {
+    const candles = await fetcher(pair.market, pair.api, frame, limit);
+    if (candles && candles.length) return dropOpenCandle(candles);
+  }
+  return [];
+}
+
+async function fetchBinanceTicker(market, symbol) {
+  const base = market === "futures" ? BINANCE_FUT : BINANCE_SPOT;
+  const url = `${base}/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+  const json = await httpGetJson(url);
+  if (!json || !json.lastPrice) return null;
+  return {
+    priceUsd: Number(json.lastPrice),
+    changeH24: Number(json.priceChangePercent || 0),
+    volumeH24Usd: Number(json.quoteVolume || 0),
+    txH24: Number(json.count || 0),
+  };
+}
+
+async function fetchBybitTicker(market, symbol) {
+  const category = market === "futures" ? "linear" : "spot";
+  const url = `${BYBIT_BASE}/tickers?category=${category}&symbol=${encodeURIComponent(symbol)}`;
+  const json = await httpGetJson(url);
+  const row = json && json.result && json.result.list && json.result.list[0];
+  if (!row || !row.lastPrice) return null;
+  return {
+    priceUsd: Number(row.lastPrice),
+    changeH24: Number(row.price24hPcnt || 0) * 100,
+    volumeH24Usd: Number(row.turnover24h || 0),
+    txH24: 0,
+  };
+}
+
+async function fetchTicker(pair) {
+  const order = state.exchange === "bybit"
+    ? [fetchBybitTicker, fetchBinanceTicker]
+    : [fetchBinanceTicker, fetchBybitTicker];
+  for (const fetcher of order) {
+    const ticker = await fetcher(pair.market, pair.api);
+    if (ticker) return ticker;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Technical analysis engine (timeframe-agnostic; unchanged from v1)
+// ---------------------------------------------------------------------------
 
 function ema(values, period) {
   if (values.length < period) return [];
@@ -531,8 +653,30 @@ function bosSignal(candles, swings) {
   };
 }
 
-function analyzePool(pool, candles) {
-  if (candles.length < 55) return null;
+// Lightweight higher/lower timeframe trend read used for consensus.
+function timeframeTrend(candles) {
+  if (candles.length < 55) return "mixed";
+  const closes = candles.map((c) => c.close);
+  const e20 = ema(closes, 20).pop();
+  const e50 = ema(closes, 50).pop();
+  const structure = trendFromSwings(swingPoints(candles, 2));
+  const last = candles[candles.length - 1].close;
+  if (structure === "bullish" && last > e20 && e20 > e50) return "bullish";
+  if (structure === "bearish" && last < e20 && e20 < e50) return "bearish";
+  if (e20 && e50) {
+    if (last > e20 && e20 > e50) return "bullish";
+    if (last < e20 && e20 < e50) return "bearish";
+  }
+  return "mixed";
+}
+
+// ---------------------------------------------------------------------------
+// Multi-timeframe signal build
+// ---------------------------------------------------------------------------
+
+function analyzePair(pair, ticker, tf) {
+  const candles = tf["15m"];
+  if (!candles || candles.length < 55) return null;
   const closes = candles.map((c) => c.close);
   const ema20 = ema(closes, 20);
   const ema50 = ema(closes, 50);
@@ -552,40 +696,40 @@ function analyzePool(pool, candles) {
   const volExpansion = avgVol > 0 && last.volume > avgVol * 1.25;
   const lastMovePct = pctChange(prev.close, last.close);
 
-  const long = scoreSide("long", {
-    pool,
-    candles,
-    last,
-    trend,
-    levels,
-    retest,
-    bos,
-    patterns,
-    e20,
-    e50,
-    rsiValue,
-    volExpansion,
-    lastMovePct,
-    volatility,
-  });
-  const short = scoreSide("short", {
-    pool,
-    candles,
-    last,
-    trend,
-    levels,
-    retest,
-    bos,
-    patterns,
-    e20,
-    e50,
-    rsiValue,
-    volExpansion,
-    lastMovePct,
-    volatility,
-  });
+  const trendH1 = timeframeTrend(tf["1h"] || []);
+  const trendM5 = timeframeTrend(tf["5m"] || []);
+
+  const baseCtx = {
+    pair, candles, last, trend, levels, retest, bos, patterns,
+    e20, e50, rsiValue, volExpansion, lastMovePct, volatility,
+    trendH1, trendM5,
+  };
+  const long = scoreSide("long", baseCtx);
+  const short = scoreSide("short", baseCtx);
   const winner = long.score >= short.score ? long : short;
   if (winner.score < 45) return null;
+
+  // 1h consensus gate: never fight the higher timeframe when it clearly opposes.
+  const opposesH1 = (winner.side === "long" && trendH1 === "bearish")
+    || (winner.side === "short" && trendH1 === "bullish");
+  if (state.useHtfGate && opposesH1) return null;
+
+  // Attach exchange / pair identity + market context for the alert.
+  winner.exchange = state.exchange;
+  winner.market = pair.market;
+  winner.symbol = pair.api;
+  winner.tvSymbol = pair.tv;
+  winner.name = pair.label;
+  winner.url = tvChartUrl(pair.tv);
+  winner.trendH1 = trendH1;
+  winner.trendM5 = trendM5;
+  winner.changeM15 = lastMovePct;
+  winner.changeH1 = tf["1h"] && tf["1h"].length >= 2
+    ? pctChange(tf["1h"][tf["1h"].length - 2].close, tf["1h"][tf["1h"].length - 1].close)
+    : 0;
+  winner.changeH24 = ticker ? ticker.changeH24 : 0;
+  winner.volumeH24Usd = ticker ? ticker.volumeH24Usd : 0;
+  winner.price = ticker && ticker.priceUsd ? ticker.priceUsd : last.close;
   return winner;
 }
 
@@ -633,6 +777,11 @@ function scoreSide(side, ctx) {
   if (long && compressionBreakout(ctx.candles, "long")) add(10, "Compression breakout");
   if (!long && compressionBreakout(ctx.candles, "short")) add(10, "Compression breakdown");
 
+  // Multi-timeframe consensus bonuses.
+  const agreeWord = long ? "bullish" : "bearish";
+  if (ctx.trendH1 === agreeWord) add(12, "1h trend aligned");
+  if (ctx.trendM5 === agreeWord) add(6, "5m momentum aligned");
+
   const rawScore = Math.min(100, score.reduce((sum, n) => sum + n, 0));
   const stop = long
     ? Math.max(0, Math.min(ctx.levels.support || last.close - ctx.volatility, last.close - ctx.volatility * 1.25))
@@ -645,9 +794,6 @@ function scoreSide(side, ctx) {
 
   confirmations.push(...reasons);
   return {
-    network: ctx.pool.network,
-    poolAddress: ctx.pool.address,
-    name: ctx.pool.name,
     side,
     score: Math.round(rawScore),
     price: last.close,
@@ -658,76 +804,37 @@ function scoreSide(side, ctx) {
     target2,
     rsi: ctx.rsiValue,
     trend: ctx.trend,
-    liquidityUsd: ctx.pool.liquidityUsd,
-    volumeH1Usd: ctx.pool.volumeH1Usd,
-    volumeH24Usd: ctx.pool.volumeH24Usd,
-    txH1: ctx.pool.txH1,
-    changeM15: ctx.pool.changeM15,
-    changeH1: ctx.pool.changeH1,
-    changeH24: ctx.pool.changeH24,
     confirmations,
     time: new Date(last.time).toISOString(),
-    url: poolUrl(ctx.pool.network, ctx.pool.address),
   };
 }
 
-function filterPools(pools) {
-  return pools
-    .filter((p) => p.address)
-    .filter((p) => p.priceUsd > 0)
-    .filter((p) => p.liquidityUsd >= Number(state.minLiquidityUsd || 0))
-    .filter((p) => p.volumeH1Usd >= Number(state.minVolumeH1Usd || 0))
-    .filter((p) => p.txH1 >= Number(state.minTxH1 || 0))
-    .sort((a, b) => {
-      const aScore = a.volumeH1Usd + a.liquidityUsd * 0.2 + a.txH1 * 100;
-      const bScore = b.volumeH1Usd + b.liquidityUsd * 0.2 + b.txH1 * 100;
-      return bScore - aScore;
-    })
-    .slice(0, Number(state.maxPoolsPerNetwork || 12));
-}
+// ---------------------------------------------------------------------------
+// Scan loop
+// ---------------------------------------------------------------------------
 
 async function scanMarkets(manual = false) {
   const started = Date.now();
   const signals = [];
   const errors = [];
 
-  for (const network of state.networks) {
-    let pools = [];
+  for (const pair of state.pairs) {
     try {
-      pools = filterPools(await fetchTrendingPools(network));
-    } catch (err) {
-      errors.push(`${network}: ${err.message}`);
-    }
-
-    for (const pool of pools) {
-      try {
-        const candles = await fetchOhlcv(network, pool.address, "15m", 96);
-        const signal = analyzePool(pool, candles);
-        if (signal) signals.push(signal);
-      } catch (err) {
-        errors.push(`${pool.name}: ${err.message}`);
+      const ticker = await fetchTicker(pair);
+      if (ticker && ticker.volumeH24Usd < Number(state.minQuoteVolume24h || 0)) {
+        continue; // skip thin books
       }
-      await sleep(550);
-    }
-  }
-
-  const watched = Array.isArray(state.watchedPools) ? state.watchedPools : [];
-  for (const item of watched) {
-    try {
-      const pool = await fetchPool(item.network, item.address);
-      if (!pool || !pool.priceUsd) continue;
-      const duplicate = signals.some((s) => s.network === pool.network && s.poolAddress === pool.address);
-      const candles = await fetchOhlcv(pool.network, pool.address, "15m", 96);
-      const signal = analyzePool(pool, candles);
-      if (signal && !duplicate) {
-        signal.confirmations.unshift("Manual watchlist pair");
-        signal.score = Math.min(100, signal.score + 5);
-        signals.push(signal);
-      }
+      const [c15, c5, c1h] = await Promise.all([
+        fetchKlines(pair, "15m", 150),
+        fetchKlines(pair, "5m", 120),
+        fetchKlines(pair, "1h", 120),
+      ]);
+      const signal = analyzePair(pair, ticker, { "15m": c15, "5m": c5, "1h": c1h });
+      if (signal) signals.push(signal);
     } catch (err) {
-      errors.push(`${item.network}:${item.address}: ${err.message}`);
+      errors.push(`${pair.api}: ${err.message}`);
     }
-    await sleep(550);
+    await sleep(250);
   }
 
   signals.sort((a, b) => b.score - a.score);
@@ -737,7 +844,8 @@ async function scanMarkets(manual = false) {
   const summary = {
     scannedAt: new Date().toISOString(),
     durationMs: Date.now() - started,
-    networks: state.networks,
+    exchange: state.exchange,
+    pairs: state.pairs.length,
     candidates: signals.length,
     accepted: accepted.length,
     fresh: fresh.length,
@@ -770,13 +878,13 @@ async function scanMarkets(manual = false) {
 }
 
 function cooldownKey(signal) {
-  return `${signal.network}:${signal.poolAddress}:${signal.side}`;
+  return `${signal.exchange}:${signal.market}:${signal.symbol}:${signal.side}`;
 }
 
 function isCoolingDown(signal) {
   const key = cooldownKey(signal);
   const last = Number(state.lastAlerts[key] || 0);
-  const cooldownMs = Number(state.cooldownMinutes || 45) * 60 * 1000;
+  const cooldownMs = Number(state.cooldownMinutes || 30) * 60 * 1000;
   return Date.now() - last < cooldownMs;
 }
 
@@ -803,6 +911,12 @@ async function broadcastSignal(signal) {
   }
 }
 
+function trendGlyph(trend) {
+  if (trend === "bullish") return "bullish";
+  if (trend === "bearish") return "bearish";
+  return "mixed";
+}
+
 function formatSignal(signal) {
   const direction = signal.side === "long" ? "LONG SETUP" : "SHORT SETUP";
   const conf = signal.confirmations.slice(0, 6)
@@ -816,33 +930,40 @@ function formatSignal(signal) {
     hour: "2-digit",
     minute: "2-digit",
   });
+  const marketName = `${exchangeLabel(signal.exchange)} ${MARKET_LABELS[signal.market] || signal.market}`;
 
   return `<b>${BOT_NAME}</b>\n\n` +
     `<b>${esc(signal.name)} | ${direction}</b>\n` +
-    `Network: <b>${esc(networkLabel(signal.network))}</b>\n` +
-    `Timeframe: <b>15m</b>\n` +
+    `Exchange: <b>${esc(marketName)}</b>\n` +
+    `Timeframe: <b>15m</b> (multi-TF consensus)\n` +
     `Time: <b>${esc(time)} WAT</b>\n\n` +
     `<b>Setup Quality</b>\n` +
     `Confidence: <b>${signal.score}%</b>\n` +
     `Trend: <b>${esc(signal.trend)}</b>\n` +
     `RSI: <b>${signal.rsi.toFixed(1)}</b>\n\n` +
+    `<b>Timeframe Consensus</b>\n` +
+    `5m: <b>${esc(trendGlyph(signal.trendM5))}</b>\n` +
+    `15m: <b>${esc(trendGlyph(signal.trend))}</b>\n` +
+    `1h: <b>${esc(trendGlyph(signal.trendH1))}</b>\n\n` +
     `<b>Confluence</b>\n${conf}\n\n` +
     `<b>Market Context</b>\n` +
     `Price: <code>${fmtPrice(signal.price)}</code>\n` +
     `15m change: <b>${fmtPct(signal.changeM15)}</b>\n` +
     `1h change: <b>${fmtPct(signal.changeH1)}</b>\n` +
-    `Liquidity: <b>${fmtUsd(signal.liquidityUsd)}</b>\n` +
-    `1h volume: <b>${fmtUsd(signal.volumeH1Usd)}</b>\n\n` +
+    `24h change: <b>${fmtPct(signal.changeH24)}</b>\n` +
+    `24h volume: <b>${fmtUsd(signal.volumeH24Usd)}</b>\n\n` +
     `<b>Trade Map</b>\n` +
     `Entry zone: <code>${fmtPrice(signal.entryLow)} - ${fmtPrice(signal.entryHigh)}</code>\n` +
     `Invalidation: <code>${fmtPrice(signal.stop)}</code>\n` +
     `Targets: <code>${fmtPrice(signal.target1)}</code> / <code>${fmtPrice(signal.target2)}</code>\n\n` +
+    `<b>TradingView</b>\n<code>${esc(signal.tvSymbol)}</code>\n\n` +
     `<i>Manual execution only. This is a scanner alert, not financial advice.</i>`;
 }
 
 function printDryRun(summary) {
   console.log(`${BOT_NAME} dry run`);
-  console.log(`Networks: ${summary.networks.join(", ")}`);
+  console.log(`Exchange: ${summary.exchange}`);
+  console.log(`Pairs: ${summary.pairs}`);
   console.log(`Duration: ${(summary.durationMs / 1000).toFixed(1)}s`);
   console.log(`Candidates: ${summary.candidates}`);
   console.log(`Above threshold: ${summary.accepted}`);
@@ -850,8 +971,9 @@ function printDryRun(summary) {
   if (summary.errors.length) {
     console.log(`Errors: ${summary.errors.join(" | ")}`);
   }
-  for (const s of summary.top.slice(0, 5)) {
-    console.log(`- ${s.score}% ${s.side.toUpperCase()} ${s.name} ${s.network} price=${fmtPrice(s.price)} vol1h=${fmtUsd(s.volumeH1Usd)}`);
+  for (const s of summary.top.slice(0, 8)) {
+    console.log(`- ${s.score}% ${s.side.toUpperCase()} ${s.name} [${s.market}] price=${fmtPrice(s.price)} ` +
+      `5m/15m/1h=${trendGlyph(s.trendM5)}/${trendGlyph(s.trend)}/${trendGlyph(s.trendH1)}`);
     console.log(`  ${s.confirmations.slice(0, 4).join("; ")}`);
   }
 }
@@ -860,25 +982,30 @@ async function sendToOwner(text) {
   return sendHtml(DEFAULT_OWNER_CHAT_ID, text);
 }
 
+// ---------------------------------------------------------------------------
+// Telegram text
+// ---------------------------------------------------------------------------
+
 function statusText() {
   const chats = state.alertChatIds.map((id) => `<code>${esc(id)}</code>`).join(", ");
   const alerts = loadJson(ALERTS_FILE, []);
   const signals = loadJson(SIGNALS_FILE, []);
   const lastScan = signals[0] && signals[0].scannedAt ? signals[0].scannedAt : "never";
+  const spot = state.pairs.filter((p) => p.market === "spot").length;
+  const futures = state.pairs.filter((p) => p.market === "futures").length;
   return `<b>${BOT_NAME} Status</b>\n\n` +
+    `Mode: <b>Major exchange pairs</b>\n` +
+    `Exchange: <b>${esc(exchangeLabel(state.exchange))}</b>\n` +
     `Paused: <b>${state.paused ? "yes" : "no"}</b>\n` +
-    `Networks: <b>${esc(state.networks.join(", "))}</b>\n` +
+    `Pairs: <b>${state.pairs.length}</b> (spot ${spot}, futures ${futures})\n` +
+    `Timeframes: <b>5m / 15m / 1h</b>\n` +
+    `1h trend gate: <b>${state.useHtfGate ? "on" : "off"}</b>\n` +
     `Threshold: <b>${state.alertThreshold}%</b>\n` +
     `Cooldown: <b>${state.cooldownMinutes} min</b>\n` +
-    `Scan interval: <b>${state.scanIntervalMinutes} min</b>\n\n` +
-    `<b>Filters</b>\n` +
-    `Min liquidity: <b>${fmtUsd(state.minLiquidityUsd)}</b>\n` +
-    `Min 1h volume: <b>${fmtUsd(state.minVolumeH1Usd)}</b>\n` +
-    `Min 1h txns: <b>${state.minTxH1}</b>\n` +
-    `Max pools/network: <b>${state.maxPoolsPerNetwork}</b>\n\n` +
+    `Scan interval: <b>${state.scanIntervalMinutes} min</b>\n` +
+    `Min 24h volume: <b>${fmtUsd(state.minQuoteVolume24h)}</b>\n\n` +
     `<b>Alerts</b>\n` +
     `Chats: ${chats || "none"}\n` +
-    `Watched pools: <b>${state.watchedPools.length}</b>\n` +
     `Stored alerts: <b>${alerts.length}</b>\n` +
     `Last scan: <code>${esc(lastScan)}</code>`;
 }
@@ -889,7 +1016,8 @@ function commandPattern(command) {
 
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
-    `Crypto market-structure scanner for group alerts.\n\n` +
+    `Multi-timeframe market-structure scanner for major exchange pairs.\n` +
+    `Spot and futures, 5m/15m/1h consensus, TradingView links.\n\n` +
     `<b>Commands</b>\n` +
     `/id - show this chat id\n` +
     `/activate - owner only, enable alerts here\n` +
@@ -899,54 +1027,22 @@ function helpText() {
     `/testalert - owner only, preview alert rendering\n` +
     `/pause - owner only, pause alerts\n` +
     `/resume - owner only, resume alerts\n` +
-    `/networks - show networks\n` +
-    `/addnetwork solana - owner only\n` +
-    `/removenetwork base - owner only\n` +
-    `/watch solana POOL_ADDRESS - owner only\n` +
-    `/watch https://www.geckoterminal.com/solana/pools/POOL - owner only\n` +
-    `/watch https://dexscreener.com/solana/POOL - owner only\n` +
-    `/unwatch solana POOL_ADDRESS - owner only\n` +
-    `/watchlist - show exact watched pools\n` +
-    `/threshold 72 - owner only\n` +
-    `/filters - show scan filters\n` +
-    `/liquidity 25k - owner only\n` +
-    `/volume 5k - owner only\n` +
-    `/txns 25 - owner only\n` +
-    `/pools 12 - owner only\n\n` +
+    `/pairs - list tracked pairs\n` +
+    `/addpair BTCUSDT - owner only, add spot pair\n` +
+    `/addpair BTCUSDT futures - owner only, add futures pair\n` +
+    `/removepair BTCUSDT - owner only\n` +
+    `/resetpairs - owner only, restore defaults\n` +
+    `/exchange binance - owner only, set data source (binance/bybit)\n` +
+    `/threshold 65 - owner only\n\n` +
     `<i>Manual execution only. No wallet. No trading.</i>`;
-}
-
-function parsePoolWatchArgs(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return null;
-  const urlMatch = raw.match(/geckoterminal\.com\/([^/\s]+)\/pools\/([^?\s]+)/i);
-  if (urlMatch) {
-    return {
-      network: urlMatch[1].toLowerCase(),
-      address: urlMatch[2],
-    };
-  }
-  const dexMatch = raw.match(/dexscreener\.com\/([^/\s]+)\/([^?\s]+)/i);
-  if (dexMatch) {
-    return {
-      network: dexMatch[1].toLowerCase(),
-      address: dexMatch[2],
-    };
-  }
-  const parts = raw.split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) {
-    return {
-      network: parts[0].toLowerCase(),
-      address: parts[1],
-    };
-  }
-  return null;
 }
 
 function sampleSignal() {
   return {
-    network: "solana",
-    poolAddress: "preview",
+    exchange: "binance",
+    market: "futures",
+    symbol: "BTCUSDT",
+    tvSymbol: "BINANCE:BTCUSDT.P",
     name: "BTC / USDT",
     side: "long",
     score: 84,
@@ -958,24 +1054,35 @@ function sampleSignal() {
     target2: 65850,
     rsi: 58.4,
     trend: "bullish",
-    liquidityUsd: 1250000,
-    volumeH1Usd: 285000,
-    volumeH24Usd: 5200000,
-    txH1: 420,
+    trendH1: "bullish",
+    trendM5: "bullish",
     changeM15: 1.24,
     changeH1: 3.18,
     changeH24: 9.72,
+    volumeH24Usd: 5200000000,
     confirmations: [
       "Format preview only",
       "Bullish market structure",
-      "Previous resistance retested as support",
-      "Bullish engulfing confirmation",
-      "Price aligned above 20/50 EMA",
+      "Break and retest above prior resistance",
+      "1h trend aligned",
+      "5m momentum aligned",
     ],
     time: new Date().toISOString(),
-    url: "https://www.geckoterminal.com/",
+    url: "https://www.tradingview.com/chart/?symbol=BINANCE%3ABTCUSDT.P",
   };
 }
+
+function pairsText() {
+  if (!state.pairs.length) return `<b>${BOT_NAME}</b>\n\nNo pairs tracked. Use /addpair BTCUSDT.`;
+  const rows = state.pairs.map((p, i) =>
+    `${i + 1}. <b>${esc(p.label)}</b> <code>${esc(p.api)}</code> [${esc(p.market)}]`
+  ).join("\n");
+  return `<b>Tracked Pairs (${state.pairs.length})</b>\n\n${rows}`;
+}
+
+// ---------------------------------------------------------------------------
+// Command handlers
+// ---------------------------------------------------------------------------
 
 if (!dryRun) {
   bot.onText(commandPattern("start"), (msg) => {
@@ -1030,161 +1137,81 @@ if (!dryRun) {
     sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nAuto alerts resumed.`);
   });
 
-  bot.onText(commandPattern("networks"), (msg) => {
-    sendHtml(msg.chat.id,
-      `<b>Scanned Networks</b>\n\n` +
-      `${esc(state.networks.join(", "))}\n\n` +
-      `Common ids: <code>solana</code>, <code>base</code>, <code>eth</code>, <code>bsc</code>, <code>arbitrum</code>.`
-    );
+  bot.onText(commandPattern("pairs"), (msg) => {
+    sendHtml(msg.chat.id, pairsText());
   });
 
-  bot.onText(commandPattern("watch"), async (msg, match) => {
+  bot.onText(commandPattern("addpair"), (msg, match) => {
     if (!ownerGuard(msg)) return;
-    const parsed = parsePoolWatchArgs(match[1]);
-    if (!parsed) {
+    const pair = parsePairInput(match[1]);
+    if (!pair) {
       return sendHtml(msg.chat.id,
         `Usage:\n` +
-        `<code>/watch solana POOL_ADDRESS</code>\n` +
-        `<code>/watch https://www.geckoterminal.com/solana/pools/POOL_ADDRESS</code>\n` +
-        `<code>/watch https://dexscreener.com/solana/POOL_ADDRESS</code>`
+        `<code>/addpair BTCUSDT</code> (spot)\n` +
+        `<code>/addpair BTCUSDT futures</code> (perp)\n` +
+        `<code>/addpair BINANCE:BTCUSDT.P</code>`
       );
     }
-    const exists = state.watchedPools.some((p) => p.network === parsed.network && p.address === parsed.address);
-    if (!exists) {
-      state.watchedPools.push(parsed);
-      saveJson(STATE_FILE, state);
+    const exists = state.pairs.some((p) => p.api === pair.api && p.market === pair.market);
+    if (exists) {
+      return sendHtml(msg.chat.id, `<b>${esc(pair.label)}</b> [${pair.market}] is already tracked.`);
     }
-    const pool = await fetchPool(parsed.network, parsed.address);
-    const label = pool ? pool.name : `${parsed.network}:${parsed.address}`;
+    state.pairs.push(pair);
+    saveJson(STATE_FILE, state);
     sendHtml(msg.chat.id,
-      `<b>Watchlist Updated</b>\n\n` +
-      `Added: <b>${esc(label)}</b>\n` +
-      `Network: <code>${esc(parsed.network)}</code>\n` +
-      `Pool: <code>${esc(parsed.address)}</code>`
+      `<b>Pair Added</b>\n\n` +
+      `${esc(pair.label)} <code>${esc(pair.api)}</code> [${esc(pair.market)}]\n` +
+      `TradingView: <code>${esc(pair.tv)}</code>\n\n` +
+      `Now tracking <b>${state.pairs.length}</b> pairs.`
     );
   });
 
-  bot.onText(commandPattern("unwatch"), (msg, match) => {
+  bot.onText(commandPattern("removepair"), (msg, match) => {
     if (!ownerGuard(msg)) return;
-    const parsed = parsePoolWatchArgs(match[1]);
-    if (!parsed) return sendHtml(msg.chat.id, "Usage: <code>/unwatch solana POOL_ADDRESS</code>");
-    const before = state.watchedPools.length;
-    state.watchedPools = state.watchedPools.filter((p) => !(p.network === parsed.network && p.address === parsed.address));
+    const token = String(match[1] || "").trim().toUpperCase().replace(/^[A-Z]+:/, "").replace(/\.P$/, "");
+    if (!token) return sendHtml(msg.chat.id, "Usage: <code>/removepair BTCUSDT</code>");
+    const before = state.pairs.length;
+    state.pairs = state.pairs.filter((p) => p.api !== token);
     saveJson(STATE_FILE, state);
     sendHtml(msg.chat.id,
-      before === state.watchedPools.length
-        ? "That pool was not on the watchlist."
-        : `<b>Watchlist Updated</b>\n\nRemoved <code>${esc(parsed.network)}:${esc(parsed.address)}</code>.`
+      before === state.pairs.length
+        ? `<code>${esc(token)}</code> was not tracked.`
+        : `<b>Pair Removed</b>\n\nRemoved <code>${esc(token)}</code>. Now tracking <b>${state.pairs.length}</b> pairs.`
     );
   });
 
-  bot.onText(commandPattern("watchlist"), (msg) => {
-    if (!state.watchedPools.length) {
-      return sendHtml(msg.chat.id,
-        `<b>Exact Pair Watchlist</b>\n\n` +
-        `No exact pools added yet.\n\n` +
-        `Use:\n<code>/watch solana POOL_ADDRESS</code>`
-      );
+  bot.onText(commandPattern("resetpairs"), (msg) => {
+    if (!ownerGuard(msg)) return;
+    state.pairs = DEFAULT_PAIRS.map((p) => ({ ...p }));
+    saveJson(STATE_FILE, state);
+    sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nPairs reset to the ${state.pairs.length} default majors.`);
+  });
+
+  bot.onText(commandPattern("exchange"), (msg, match) => {
+    if (!ownerGuard(msg)) return;
+    const choice = String(match[1] || "").trim().toLowerCase();
+    if (choice !== "binance" && choice !== "bybit") {
+      return sendHtml(msg.chat.id, "Usage: <code>/exchange binance</code> or <code>/exchange bybit</code>");
     }
-    const rows = state.watchedPools.map((p, i) =>
-      `${i + 1}. <code>${esc(p.network)}</code> ${esc(p.address)}`
-    ).join("\n");
-    sendHtml(msg.chat.id, `<b>Exact Pair Watchlist</b>\n\n${rows}`);
-  });
-
-  bot.onText(commandPattern("addnetwork"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const network = String(match[1] || "").trim().toLowerCase();
-    if (!network) return sendHtml(msg.chat.id, "Usage: <code>/addnetwork solana</code>");
-    if (!state.networks.includes(network)) state.networks.push(network);
+    state.exchange = choice;
     saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Added network: <code>${esc(network)}</code>`);
-  });
-
-  bot.onText(commandPattern("removenetwork"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const network = String(match[1] || "").trim().toLowerCase();
-    if (!network) return sendHtml(msg.chat.id, "Usage: <code>/removenetwork base</code>");
-    state.networks = state.networks.filter((n) => n !== network);
-    if (!state.networks.length) state.networks = ["solana"];
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Removed network: <code>${esc(network)}</code>`);
+    sendHtml(msg.chat.id, `Primary data source set to <b>${esc(exchangeLabel(choice))}</b>.`);
   });
 
   bot.onText(commandPattern("threshold"), (msg, match) => {
     if (!ownerGuard(msg)) return;
     const score = Number(String(match[1] || "").trim());
     if (!Number.isFinite(score) || score < 45 || score > 95) {
-      return sendHtml(msg.chat.id, "Usage: <code>/threshold 72</code>\nAllowed range: 45-95.");
+      return sendHtml(msg.chat.id, "Usage: <code>/threshold 65</code>\nAllowed range: 45-95.");
     }
     state.alertThreshold = Math.round(score);
     saveJson(STATE_FILE, state);
     sendHtml(msg.chat.id, `Alert threshold set to <b>${state.alertThreshold}%</b>.`);
   });
 
-  bot.onText(commandPattern("filters"), (msg) => {
-    sendHtml(msg.chat.id,
-      `<b>Scan Filters</b>\n\n` +
-      `Min liquidity: <b>${fmtUsd(state.minLiquidityUsd)}</b>\n` +
-      `Min 1h volume: <b>${fmtUsd(state.minVolumeH1Usd)}</b>\n` +
-      `Min 1h txns: <b>${state.minTxH1}</b>\n` +
-      `Max pools/network: <b>${state.maxPoolsPerNetwork}</b>\n` +
-      `Alert threshold: <b>${state.alertThreshold}%</b>\n\n` +
-      `Examples:\n` +
-      `<code>/liquidity 50k</code>\n` +
-      `<code>/volume 10k</code>\n` +
-      `<code>/txns 40</code>\n` +
-      `<code>/pools 20</code>`
-    );
-  });
-
-  bot.onText(commandPattern("liquidity"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const amount = parseAmount(match[1]);
-    if (!Number.isFinite(amount) || amount < 1000) {
-      return sendHtml(msg.chat.id, "Usage: <code>/liquidity 25k</code>");
-    }
-    state.minLiquidityUsd = Math.round(amount);
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Minimum liquidity set to <b>${fmtUsd(state.minLiquidityUsd)}</b>.`);
-  });
-
-  bot.onText(commandPattern("volume"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const amount = parseAmount(match[1]);
-    if (!Number.isFinite(amount) || amount < 100) {
-      return sendHtml(msg.chat.id, "Usage: <code>/volume 5k</code>");
-    }
-    state.minVolumeH1Usd = Math.round(amount);
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Minimum 1h volume set to <b>${fmtUsd(state.minVolumeH1Usd)}</b>.`);
-  });
-
-  bot.onText(commandPattern("txns"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const count = Number(String(match[1] || "").trim());
-    if (!Number.isFinite(count) || count < 1 || count > 5000) {
-      return sendHtml(msg.chat.id, "Usage: <code>/txns 25</code>");
-    }
-    state.minTxH1 = Math.round(count);
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Minimum 1h transactions set to <b>${state.minTxH1}</b>.`);
-  });
-
-  bot.onText(commandPattern("pools"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const count = Number(String(match[1] || "").trim());
-    if (!Number.isFinite(count) || count < 1 || count > 40) {
-      return sendHtml(msg.chat.id, "Usage: <code>/pools 12</code>\nAllowed range: 1-40.");
-    }
-    state.maxPoolsPerNetwork = Math.round(count);
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Max pools per network set to <b>${state.maxPoolsPerNetwork}</b>.`);
-  });
-
   bot.onText(commandPattern("scan"), async (msg) => {
     if (!ownerGuard(msg)) return;
-    sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nManual scan started. This can take about 20-60 seconds.`);
+    sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nManual scan started. This can take about 15-40 seconds.`);
     const summary = await scanMarkets(true);
     if (summary.fresh > 0) {
       sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nManual scan sent <b>${summary.fresh}</b> fresh alert(s).`);
@@ -1202,6 +1229,10 @@ if (!dryRun) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Runner
+// ---------------------------------------------------------------------------
+
 async function autoLoop() {
   if (sendTest) {
     await sendToOwner(`<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(sampleSignal())}`);
@@ -1215,7 +1246,7 @@ async function autoLoop() {
   console.log(`${BOT_NAME} is running.`);
   console.log(`Owner ID: ${OWNER_ID}`);
   console.log(`Alert chats: ${state.alertChatIds.join(", ")}`);
-  console.log(`Networks: ${state.networks.join(", ")}`);
+  console.log(`Exchange: ${state.exchange}, pairs: ${state.pairs.length}`);
 
   await sendToOwner(`<b>${BOT_NAME}</b>\n\nBot started.\nUse /id in your group, then /activate to enable group alerts.`);
 

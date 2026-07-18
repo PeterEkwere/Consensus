@@ -1,11 +1,15 @@
 # Consensus Reaper
 
-Lean crypto market-structure Telegram alert bot.
+Lean, single-file crypto market-structure Telegram alert bot for **major exchange pairs**.
+
+- Tracks curated major pairs on **Binance Spot and Futures** (Bybit fallback if Binance is geo-blocked).
+- Multi-timeframe consensus: **5m + 15m + 1h**. 15m is the setup timeframe, 1h gates the direction, 5m confirms momentum.
+- Pairs shown as **TradingView symbols** with chart links. No wallet, no trading, no API key.
 
 ## Local Setup
 
 ```bash
-cd consensus_reaper
+cd Consensus
 npm install
 cp .env.example .env
 ```
@@ -16,7 +20,7 @@ Put the Telegram bot token in `.env`:
 TELEGRAM_BOT_TOKEN=your_token_here
 ```
 
-Run a dry scan:
+Run a dry scan (prints candidates, sends nothing):
 
 ```bash
 npm run scan
@@ -28,9 +32,9 @@ Start the bot:
 npm start
 ```
 
-## Telegram Setup
+## Telegram Commands
 
-Add the bot to your group, then send:
+Setup in a group:
 
 ```text
 /id
@@ -38,14 +42,26 @@ Add the bot to your group, then send:
 /status
 ```
 
-Exact pool watch commands:
+Pair management (owner only):
 
 ```text
-/watch solana POOL_ADDRESS
-/watch https://www.geckoterminal.com/solana/pools/POOL_ADDRESS
-/watch https://dexscreener.com/solana/POOL_ADDRESS
-/watchlist
-/unwatch solana POOL_ADDRESS
+/pairs
+/addpair BTCUSDT            # spot
+/addpair BTCUSDT futures    # perpetual
+/addpair BINANCE:BTCUSDT.P  # TradingView form
+/removepair BTCUSDT
+/resetpairs
+```
+
+Runtime (owner only):
+
+```text
+/scan
+/testalert
+/pause
+/resume
+/threshold 65
+/exchange binance   # or: /exchange bybit
 ```
 
 ## Server Run With PM2
@@ -59,13 +75,13 @@ npm install -g pm2
 Clone and install:
 
 ```bash
-git clone https://github.com/PeterEkwere/memecoin_tracker_twitter.git
-cd memecoin_tracker_twitter/consensus_reaper
+git clone https://github.com/PeterEkwere/Consensus.git
+cd Consensus
 npm install
 cp .env.example .env
 ```
 
-Edit `.env` and add the bot token, then start:
+Edit `.env`, add the bot token, then start:
 
 ```bash
 pm2 start bot.js --name consensus-reaper
@@ -73,7 +89,17 @@ pm2 save
 pm2 startup
 ```
 
-Run the command printed by `pm2 startup`. After that, the bot will restart if the server reboots and will keep running after SSH closes.
+Run the command that `pm2 startup` prints. After that the bot restarts on reboot and keeps running after SSH closes.
+
+### Update an already-deployed server
+
+```bash
+cd Consensus
+git pull
+npm install
+pm2 restart consensus-reaper
+pm2 logs consensus-reaper --lines 100
+```
 
 Useful commands:
 
