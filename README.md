@@ -2,7 +2,7 @@
 
 Lean, single-file crypto market-structure Telegram alert bot for **major exchange pairs**.
 
-- Tracks curated major pairs on **Binance Spot and Futures** (Bybit fallback if Binance is geo-blocked).
+- Tracks curated major pairs on **OKX Spot and Futures** (perpetuals). OKX is used because it is reachable from regions where Binance/Bybit are geo-blocked.
 - Multi-timeframe consensus: **5m + 15m + 1h**. 15m is the setup timeframe, 1h gates the direction, 5m confirms momentum.
 - Pairs shown as **TradingView symbols** with chart links. No wallet, no trading, no API key.
 
@@ -61,7 +61,6 @@ Runtime (owner only):
 /pause
 /resume
 /threshold 65
-/exchange binance   # or: /exchange bybit
 ```
 
 ## Server Run With PM2

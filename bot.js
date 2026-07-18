@@ -1,12 +1,12 @@
 /**
  * Consensus Reaper
  *
- * Lean crypto market-structure alert bot for MAJOR exchange pairs.
+ * Lean, single-file crypto market-structure alert bot for MAJOR exchange pairs.
  *
- * Data sources (free, official, no API key, no wallet, no trading):
- * - Binance Spot   : https://api.binance.com/api/v3
- * - Binance Futures: https://fapi.binance.com/fapi/v1  (USDⓈ-M perpetuals)
- * - Bybit v5       : https://api.bybit.com/v5/market   (fallback if Binance is geo-blocked)
+ * Data source (free, official, no API key, no wallet, no trading):
+ * - OKX v5 market: https://www.okx.com/api/v5/market
+ *   Spot instId    : BTC-USDT
+ *   Perp instId    : BTC-USDT-SWAP
  *
  * Signals use a multi-timeframe consensus: the 15m chart is the primary setup
  * timeframe, the 1h chart gates the trade direction, and the 5m chart adds a
@@ -24,10 +24,8 @@
  *   /pairs               - list tracked pairs
  *   /addpair BTCUSDT           - owner only, add a spot pair
  *   /addpair BTCUSDT futures   - owner only, add a futures (perp) pair
- *   /addpair BINANCE:BTCUSDT.P - owner only, TradingView form also accepted
  *   /removepair BTCUSDT  - owner only, remove a pair
  *   /resetpairs          - owner only, restore the default major pairs
- *   /exchange binance|bybit - owner only, set the primary data source
  *   /threshold <score>   - owner only, set alert score threshold
  */
 
@@ -43,9 +41,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OWNER_ID = 7059352737;
 const DEFAULT_OWNER_CHAT_ID = 7059352737;
 
-const BINANCE_SPOT = "https://api.binance.com/api/v3";
-const BINANCE_FUT = "https://fapi.binance.com/fapi/v1";
-const BYBIT_BASE = "https://api.bybit.com/v5/market";
+const EXCHANGE = "OKX";
+const OKX_BASE = "https://www.okx.com/api/v5/market";
 
 const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
@@ -63,7 +60,6 @@ const DEFAULT_PAIRS = [
 const DEFAULT_STATE = {
   paused: false,
   alertChatIds: [DEFAULT_OWNER_CHAT_ID],
-  exchange: "binance",        // primary data source: binance | bybit
   pairs: DEFAULT_PAIRS,
   scanIntervalMinutes: 5,
   alertThreshold: 65,
@@ -71,11 +67,6 @@ const DEFAULT_STATE = {
   useHtfGate: true,           // require the 1h trend to agree with the trade side
   minQuoteVolume24h: 5000000, // skip thin books: 24h quote volume floor (USDT)
   lastAlerts: {},
-};
-
-const EXCHANGE_LABELS = {
-  binance: "Binance",
-  bybit: "Bybit",
 };
 
 const MARKET_LABELS = {
@@ -105,13 +96,13 @@ function makePair(symbol, market) {
   return {
     api,
     market: market === "futures" ? "futures" : "spot",
-    tv: `BINANCE:${api}${suffix}`,
+    tv: `OKX:${api}${suffix}`,
     label: labelFromSymbol(api),
   };
 }
 
 function labelFromSymbol(symbol) {
-  const quotes = ["USDT", "USDC", "FDUSD", "USD", "BTC", "ETH"];
+  const quotes = ["USDT", "USDC", "USD", "BTC", "ETH"];
   const sym = String(symbol).toUpperCase();
   for (const q of quotes) {
     if (sym.endsWith(q) && sym.length > q.length) {
@@ -123,24 +114,20 @@ function labelFromSymbol(symbol) {
 
 function migrateState(loaded) {
   const next = { ...DEFAULT_STATE, ...(loaded || {}) };
-  // Drop legacy DEX fields if a pre-existing state.json is present.
-  for (const key of ["networks", "minLiquidityUsd", "minVolumeH1Usd", "minTxH1", "maxPoolsPerNetwork", "watchedPools"]) {
+  // Drop legacy fields from older (DEX / multi-exchange) versions.
+  for (const key of [
+    "networks", "minLiquidityUsd", "minVolumeH1Usd", "minTxH1",
+    "maxPoolsPerNetwork", "watchedPools", "exchange",
+  ]) {
     delete next[key];
   }
-  // Seed / normalise the pair universe.
+  // Seed / normalise the pair universe, refreshing TradingView symbols to OKX.
   if (!Array.isArray(next.pairs) || !next.pairs.length) {
     next.pairs = DEFAULT_PAIRS;
   } else {
     next.pairs = next.pairs
       .map((p) => {
-        if (p && p.api && p.market) {
-          return {
-            api: String(p.api).toUpperCase(),
-            market: p.market === "futures" ? "futures" : "spot",
-            tv: p.tv || makePair(p.api, p.market).tv,
-            label: p.label || labelFromSymbol(p.api),
-          };
-        }
+        if (p && p.api && p.market) return makePair(p.api, p.market);
         if (typeof p === "string") return makePair(p, "futures");
         return null;
       })
@@ -149,9 +136,7 @@ function migrateState(loaded) {
   next.alertChatIds = Array.isArray(next.alertChatIds) && next.alertChatIds.length
     ? next.alertChatIds
     : [DEFAULT_OWNER_CHAT_ID];
-  // Cooldown keys changed format with the DEX -> exchange move; start clean.
-  if (!loaded || loaded.watchedPools !== undefined) next.lastAlerts = {};
-  else next.lastAlerts = next.lastAlerts || {};
+  next.lastAlerts = next.lastAlerts || {};
   return next;
 }
 
@@ -283,24 +268,9 @@ function fmtPct(n) {
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
-function parseAmount(input) {
-  const raw = String(input || "").trim().toLowerCase().replace(/[$,\s]/g, "");
-  if (!raw) return NaN;
-  const mult = raw.endsWith("m") ? 1e6 : raw.endsWith("k") ? 1e3 : 1;
-  const num = Number(raw.replace(/[km]$/, ""));
-  return Number.isFinite(num) ? num * mult : NaN;
-}
-
 function pctChange(from, to) {
   if (!from) return 0;
   return ((to - from) / from) * 100;
-}
-
-function median(values) {
-  const sorted = values.filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
-  if (!sorted.length) return 0;
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 function avg(values) {
@@ -309,12 +279,8 @@ function avg(values) {
   return nums.reduce((sum, n) => sum + n, 0) / nums.length;
 }
 
-function exchangeLabel(exchange) {
-  return EXCHANGE_LABELS[exchange] || exchange;
-}
-
 function marketLabel(pair) {
-  return `${exchangeLabel(state.exchange)} ${MARKET_LABELS[pair.market] || pair.market}`;
+  return `${EXCHANGE} ${MARKET_LABELS[pair.market] || pair.market}`;
 }
 
 function tvChartUrl(tvSymbol) {
@@ -335,131 +301,72 @@ function parsePairInput(input) {
     if (m === "spot") market = "spot";
   }
 
-  // TradingView form: "BINANCE:BTCUSDT" or "BINANCE:BTCUSDT.P"
-  const tvMatch = token.match(/^[A-Z]+:([A-Z0-9]+?)(\.P)?$/);
+  // TradingView form: "OKX:BTCUSDT" or "OKX:BTCUSDT.P"; also tolerate dashes.
+  const tvMatch = token.match(/^[A-Z]+:([A-Z0-9-]+?)(\.P)?$/);
   if (tvMatch) {
-    token = tvMatch[1];
+    token = tvMatch[1].replace(/-/g, "");
     if (tvMatch[2]) market = market || "futures";
   }
+  token = token.replace(/-/g, "");
 
   if (!/^[A-Z0-9]{5,20}$/.test(token)) return null;
   return makePair(token, market || "spot");
 }
 
 // ---------------------------------------------------------------------------
-// Exchange data adapter (Binance primary, Bybit fallback)
+// OKX data adapter
 // ---------------------------------------------------------------------------
 
-const BINANCE_INTERVAL = { "5m": "5m", "15m": "15m", "1h": "1h" };
-const BYBIT_INTERVAL = { "5m": "5", "15m": "15", "1h": "60" };
+const OKX_BAR = { "5m": "5m", "15m": "15m", "1h": "1H" };
 
-function normalizeCandles(rows) {
-  return rows
-    .filter((c) => Number.isFinite(c.close) && c.close > 0)
+// "BTCUSDT" -> "BTC-USDT" (OKX uses dashed instrument ids).
+function okxInstId(pair) {
+  const quotes = ["USDT", "USDC", "USD"];
+  const sym = pair.api.toUpperCase();
+  let dashed = sym;
+  for (const q of quotes) {
+    if (sym.endsWith(q) && sym.length > q.length) {
+      dashed = `${sym.slice(0, sym.length - q.length)}-${q}`;
+      break;
+    }
+  }
+  return pair.market === "futures" ? `${dashed}-SWAP` : dashed;
+}
+
+// OKX candle row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]; newest first.
+async function fetchCandles(pair, frame, limit = 200) {
+  const bar = OKX_BAR[frame] || "15m";
+  const url = `${OKX_BASE}/candles?instId=${encodeURIComponent(okxInstId(pair))}&bar=${bar}&limit=${limit}`;
+  const json = await httpGetJson(url);
+  const data = json && json.code === "0" && Array.isArray(json.data) ? json.data : null;
+  if (!data) return [];
+  const rows = data.map((r) => ({
+    time: Number(r[0]),
+    open: Number(r[1]),
+    high: Number(r[2]),
+    low: Number(r[3]),
+    close: Number(r[4]),
+    volume: Number(r[7] || 0), // quote-currency volume, works for spot and swap
+    confirm: r[8],
+  })).filter((c) => Number.isFinite(c.close) && c.close > 0)
     .sort((a, b) => a.time - b.time);
+  // Drop the still-forming candle so analysis only sees closed bars.
+  if (rows.length && rows[rows.length - 1].confirm === "0") rows.pop();
+  return rows;
 }
 
-// Drops the final, still-forming candle so analysis only sees closed bars.
-function dropOpenCandle(candles) {
-  if (candles.length && candles[candles.length - 1].closeTime > Date.now()) {
-    return candles.slice(0, -1);
+function quoteVolume24h(candles) {
+  if (!candles.length) return 0;
+  const lookback = Math.min(96, candles.length); // 96 x 15m = 24h
+  let sum = 0;
+  for (let i = candles.length - lookback; i < candles.length; i++) {
+    sum += candles[i].volume || 0;
   }
-  return candles;
-}
-
-async function fetchBinanceKlines(market, symbol, frame, limit) {
-  const base = market === "futures" ? BINANCE_FUT : BINANCE_SPOT;
-  const interval = BINANCE_INTERVAL[frame] || "15m";
-  const url = `${base}/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit + 1}`;
-  const json = await httpGetJson(url);
-  if (!Array.isArray(json)) return null;
-  return normalizeCandles(json.map((row) => ({
-    time: Number(row[0]),
-    open: Number(row[1]),
-    high: Number(row[2]),
-    low: Number(row[3]),
-    close: Number(row[4]),
-    volume: Number(row[5] || 0),
-    closeTime: Number(row[6]),
-  })));
-}
-
-async function fetchBybitKlines(market, symbol, frame, limit) {
-  const category = market === "futures" ? "linear" : "spot";
-  const interval = BYBIT_INTERVAL[frame] || "15";
-  const url = `${BYBIT_BASE}/kline?category=${category}&symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${limit + 1}`;
-  const json = await httpGetJson(url);
-  const list = json && json.result && json.result.list;
-  if (!Array.isArray(list)) return null;
-  // Bybit returns newest-first; each row: [start, open, high, low, close, volume, turnover].
-  return normalizeCandles(list.map((row) => ({
-    time: Number(row[0]),
-    open: Number(row[1]),
-    high: Number(row[2]),
-    low: Number(row[3]),
-    close: Number(row[4]),
-    volume: Number(row[5] || 0),
-    closeTime: Number(row[0]) + frameMs(frame),
-  })));
-}
-
-function frameMs(frame) {
-  if (frame === "5m") return 5 * 60 * 1000;
-  if (frame === "1h") return 60 * 60 * 1000;
-  return 15 * 60 * 1000;
-}
-
-async function fetchKlines(pair, frame, limit = 150) {
-  const order = state.exchange === "bybit"
-    ? [fetchBybitKlines, fetchBinanceKlines]
-    : [fetchBinanceKlines, fetchBybitKlines];
-  for (const fetcher of order) {
-    const candles = await fetcher(pair.market, pair.api, frame, limit);
-    if (candles && candles.length) return dropOpenCandle(candles);
-  }
-  return [];
-}
-
-async function fetchBinanceTicker(market, symbol) {
-  const base = market === "futures" ? BINANCE_FUT : BINANCE_SPOT;
-  const url = `${base}/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
-  const json = await httpGetJson(url);
-  if (!json || !json.lastPrice) return null;
-  return {
-    priceUsd: Number(json.lastPrice),
-    changeH24: Number(json.priceChangePercent || 0),
-    volumeH24Usd: Number(json.quoteVolume || 0),
-    txH24: Number(json.count || 0),
-  };
-}
-
-async function fetchBybitTicker(market, symbol) {
-  const category = market === "futures" ? "linear" : "spot";
-  const url = `${BYBIT_BASE}/tickers?category=${category}&symbol=${encodeURIComponent(symbol)}`;
-  const json = await httpGetJson(url);
-  const row = json && json.result && json.result.list && json.result.list[0];
-  if (!row || !row.lastPrice) return null;
-  return {
-    priceUsd: Number(row.lastPrice),
-    changeH24: Number(row.price24hPcnt || 0) * 100,
-    volumeH24Usd: Number(row.turnover24h || 0),
-    txH24: 0,
-  };
-}
-
-async function fetchTicker(pair) {
-  const order = state.exchange === "bybit"
-    ? [fetchBybitTicker, fetchBinanceTicker]
-    : [fetchBinanceTicker, fetchBybitTicker];
-  for (const fetcher of order) {
-    const ticker = await fetcher(pair.market, pair.api);
-    if (ticker) return ticker;
-  }
-  return null;
+  return sum;
 }
 
 // ---------------------------------------------------------------------------
-// Technical analysis engine (timeframe-agnostic; unchanged from v1)
+// Technical analysis engine (timeframe-agnostic)
 // ---------------------------------------------------------------------------
 
 function ema(values, period) {
@@ -674,9 +581,13 @@ function timeframeTrend(candles) {
 // Multi-timeframe signal build
 // ---------------------------------------------------------------------------
 
-function analyzePair(pair, ticker, tf) {
+function analyzePair(pair, tf) {
   const candles = tf["15m"];
   if (!candles || candles.length < 55) return null;
+
+  const vol24 = quoteVolume24h(candles);
+  if (vol24 < Number(state.minQuoteVolume24h || 0)) return null; // thin book
+
   const closes = candles.map((c) => c.close);
   const ema20 = ema(closes, 20);
   const ema50 = ema(closes, 50);
@@ -714,8 +625,8 @@ function analyzePair(pair, ticker, tf) {
     || (winner.side === "short" && trendH1 === "bullish");
   if (state.useHtfGate && opposesH1) return null;
 
-  // Attach exchange / pair identity + market context for the alert.
-  winner.exchange = state.exchange;
+  const lookback = Math.min(96, candles.length - 1);
+  winner.exchange = EXCHANGE;
   winner.market = pair.market;
   winner.symbol = pair.api;
   winner.tvSymbol = pair.tv;
@@ -727,9 +638,9 @@ function analyzePair(pair, ticker, tf) {
   winner.changeH1 = tf["1h"] && tf["1h"].length >= 2
     ? pctChange(tf["1h"][tf["1h"].length - 2].close, tf["1h"][tf["1h"].length - 1].close)
     : 0;
-  winner.changeH24 = ticker ? ticker.changeH24 : 0;
-  winner.volumeH24Usd = ticker ? ticker.volumeH24Usd : 0;
-  winner.price = ticker && ticker.priceUsd ? ticker.priceUsd : last.close;
+  winner.changeH24 = pctChange(candles[candles.length - 1 - lookback].close, last.close);
+  winner.volumeH24Usd = vol24;
+  winner.price = last.close;
   return winner;
 }
 
@@ -820,16 +731,12 @@ async function scanMarkets(manual = false) {
 
   for (const pair of state.pairs) {
     try {
-      const ticker = await fetchTicker(pair);
-      if (ticker && ticker.volumeH24Usd < Number(state.minQuoteVolume24h || 0)) {
-        continue; // skip thin books
-      }
       const [c15, c5, c1h] = await Promise.all([
-        fetchKlines(pair, "15m", 150),
-        fetchKlines(pair, "5m", 120),
-        fetchKlines(pair, "1h", 120),
+        fetchCandles(pair, "15m", 200),
+        fetchCandles(pair, "5m", 120),
+        fetchCandles(pair, "1h", 120),
       ]);
-      const signal = analyzePair(pair, ticker, { "15m": c15, "5m": c5, "1h": c1h });
+      const signal = analyzePair(pair, { "15m": c15, "5m": c5, "1h": c1h });
       if (signal) signals.push(signal);
     } catch (err) {
       errors.push(`${pair.api}: ${err.message}`);
@@ -844,7 +751,7 @@ async function scanMarkets(manual = false) {
   const summary = {
     scannedAt: new Date().toISOString(),
     durationMs: Date.now() - started,
-    exchange: state.exchange,
+    exchange: EXCHANGE,
     pairs: state.pairs.length,
     candidates: signals.length,
     accepted: accepted.length,
@@ -878,7 +785,7 @@ async function scanMarkets(manual = false) {
 }
 
 function cooldownKey(signal) {
-  return `${signal.exchange}:${signal.market}:${signal.symbol}:${signal.side}`;
+  return `${signal.market}:${signal.symbol}:${signal.side}`;
 }
 
 function isCoolingDown(signal) {
@@ -911,12 +818,6 @@ async function broadcastSignal(signal) {
   }
 }
 
-function trendGlyph(trend) {
-  if (trend === "bullish") return "bullish";
-  if (trend === "bearish") return "bearish";
-  return "mixed";
-}
-
 function formatSignal(signal) {
   const direction = signal.side === "long" ? "LONG SETUP" : "SHORT SETUP";
   const conf = signal.confirmations.slice(0, 6)
@@ -930,7 +831,7 @@ function formatSignal(signal) {
     hour: "2-digit",
     minute: "2-digit",
   });
-  const marketName = `${exchangeLabel(signal.exchange)} ${MARKET_LABELS[signal.market] || signal.market}`;
+  const marketName = `${EXCHANGE} ${MARKET_LABELS[signal.market] || signal.market}`;
 
   return `<b>${BOT_NAME}</b>\n\n` +
     `<b>${esc(signal.name)} | ${direction}</b>\n` +
@@ -942,9 +843,9 @@ function formatSignal(signal) {
     `Trend: <b>${esc(signal.trend)}</b>\n` +
     `RSI: <b>${signal.rsi.toFixed(1)}</b>\n\n` +
     `<b>Timeframe Consensus</b>\n` +
-    `5m: <b>${esc(trendGlyph(signal.trendM5))}</b>\n` +
-    `15m: <b>${esc(trendGlyph(signal.trend))}</b>\n` +
-    `1h: <b>${esc(trendGlyph(signal.trendH1))}</b>\n\n` +
+    `5m: <b>${esc(signal.trendM5)}</b>\n` +
+    `15m: <b>${esc(signal.trend)}</b>\n` +
+    `1h: <b>${esc(signal.trendH1)}</b>\n\n` +
     `<b>Confluence</b>\n${conf}\n\n` +
     `<b>Market Context</b>\n` +
     `Price: <code>${fmtPrice(signal.price)}</code>\n` +
@@ -973,7 +874,7 @@ function printDryRun(summary) {
   }
   for (const s of summary.top.slice(0, 8)) {
     console.log(`- ${s.score}% ${s.side.toUpperCase()} ${s.name} [${s.market}] price=${fmtPrice(s.price)} ` +
-      `5m/15m/1h=${trendGlyph(s.trendM5)}/${trendGlyph(s.trend)}/${trendGlyph(s.trendH1)}`);
+      `5m/15m/1h=${s.trendM5}/${s.trend}/${s.trendH1}`);
     console.log(`  ${s.confirmations.slice(0, 4).join("; ")}`);
   }
 }
@@ -995,7 +896,7 @@ function statusText() {
   const futures = state.pairs.filter((p) => p.market === "futures").length;
   return `<b>${BOT_NAME} Status</b>\n\n` +
     `Mode: <b>Major exchange pairs</b>\n` +
-    `Exchange: <b>${esc(exchangeLabel(state.exchange))}</b>\n` +
+    `Exchange: <b>${EXCHANGE}</b>\n` +
     `Paused: <b>${state.paused ? "yes" : "no"}</b>\n` +
     `Pairs: <b>${state.pairs.length}</b> (spot ${spot}, futures ${futures})\n` +
     `Timeframes: <b>5m / 15m / 1h</b>\n` +
@@ -1016,7 +917,7 @@ function commandPattern(command) {
 
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
-    `Multi-timeframe market-structure scanner for major exchange pairs.\n` +
+    `Multi-timeframe market-structure scanner for major ${EXCHANGE} pairs.\n` +
     `Spot and futures, 5m/15m/1h consensus, TradingView links.\n\n` +
     `<b>Commands</b>\n` +
     `/id - show this chat id\n` +
@@ -1032,17 +933,16 @@ function helpText() {
     `/addpair BTCUSDT futures - owner only, add futures pair\n` +
     `/removepair BTCUSDT - owner only\n` +
     `/resetpairs - owner only, restore defaults\n` +
-    `/exchange binance - owner only, set data source (binance/bybit)\n` +
     `/threshold 65 - owner only\n\n` +
     `<i>Manual execution only. No wallet. No trading.</i>`;
 }
 
 function sampleSignal() {
   return {
-    exchange: "binance",
+    exchange: EXCHANGE,
     market: "futures",
     symbol: "BTCUSDT",
-    tvSymbol: "BINANCE:BTCUSDT.P",
+    tvSymbol: "OKX:BTCUSDT.P",
     name: "BTC / USDT",
     side: "long",
     score: 84,
@@ -1068,7 +968,7 @@ function sampleSignal() {
       "5m momentum aligned",
     ],
     time: new Date().toISOString(),
-    url: "https://www.tradingview.com/chart/?symbol=BINANCE%3ABTCUSDT.P",
+    url: "https://www.tradingview.com/chart/?symbol=OKX%3ABTCUSDT.P",
   };
 }
 
@@ -1149,7 +1049,7 @@ if (!dryRun) {
         `Usage:\n` +
         `<code>/addpair BTCUSDT</code> (spot)\n` +
         `<code>/addpair BTCUSDT futures</code> (perp)\n` +
-        `<code>/addpair BINANCE:BTCUSDT.P</code>`
+        `<code>/addpair OKX:BTCUSDT.P</code>`
       );
     }
     const exists = state.pairs.some((p) => p.api === pair.api && p.market === pair.market);
@@ -1168,7 +1068,7 @@ if (!dryRun) {
 
   bot.onText(commandPattern("removepair"), (msg, match) => {
     if (!ownerGuard(msg)) return;
-    const token = String(match[1] || "").trim().toUpperCase().replace(/^[A-Z]+:/, "").replace(/\.P$/, "");
+    const token = String(match[1] || "").trim().toUpperCase().replace(/^[A-Z]+:/, "").replace(/\.P$/, "").replace(/-/g, "");
     if (!token) return sendHtml(msg.chat.id, "Usage: <code>/removepair BTCUSDT</code>");
     const before = state.pairs.length;
     state.pairs = state.pairs.filter((p) => p.api !== token);
@@ -1185,17 +1085,6 @@ if (!dryRun) {
     state.pairs = DEFAULT_PAIRS.map((p) => ({ ...p }));
     saveJson(STATE_FILE, state);
     sendHtml(msg.chat.id, `<b>${BOT_NAME}</b>\n\nPairs reset to the ${state.pairs.length} default majors.`);
-  });
-
-  bot.onText(commandPattern("exchange"), (msg, match) => {
-    if (!ownerGuard(msg)) return;
-    const choice = String(match[1] || "").trim().toLowerCase();
-    if (choice !== "binance" && choice !== "bybit") {
-      return sendHtml(msg.chat.id, "Usage: <code>/exchange binance</code> or <code>/exchange bybit</code>");
-    }
-    state.exchange = choice;
-    saveJson(STATE_FILE, state);
-    sendHtml(msg.chat.id, `Primary data source set to <b>${esc(exchangeLabel(choice))}</b>.`);
   });
 
   bot.onText(commandPattern("threshold"), (msg, match) => {
@@ -1246,7 +1135,7 @@ async function autoLoop() {
   console.log(`${BOT_NAME} is running.`);
   console.log(`Owner ID: ${OWNER_ID}`);
   console.log(`Alert chats: ${state.alertChatIds.join(", ")}`);
-  console.log(`Exchange: ${state.exchange}, pairs: ${state.pairs.length}`);
+  console.log(`Exchange: ${EXCHANGE}, pairs: ${state.pairs.length}`);
 
   await sendToOwner(`<b>${BOT_NAME}</b>\n\nBot started.\nUse /id in your group, then /activate to enable group alerts.`);
 
