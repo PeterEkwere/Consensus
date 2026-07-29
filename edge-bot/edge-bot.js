@@ -67,8 +67,20 @@ const CONFIG = {
   } catch { /* .env optional; real env vars also work */ }
 })(path.join(__dirname, '..', '.env'));
 
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '';
+// Keep server-only wallet addresses in .env so a git pull cannot overwrite them.
+// Addresses are public, but the tracked cohort is research configuration rather
+// than source code and will change as the cohort is reviewed.
+const envWallets = (process.env.HYPERLIQUID_TRACKED_WALLETS || '')
+  .split(',')
+  .map((w) => w.trim().toLowerCase())
+  .filter((w) => /^0x[a-f0-9]{40}$/.test(w));
+CONFIG.trackedWallets = [...new Set([...CONFIG.trackedWallets, ...envWallets])];
+
+// A separate Edge Bot token avoids two processes competing for Telegram
+// getUpdates. The shared token remains a send-only fallback when no Edge Bot
+// chat id is configured.
+const TG_TOKEN = process.env.EDGE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_CHAT = process.env.EDGE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '';
 
 /* ============================== UTILS ============================== */
 
@@ -106,6 +118,73 @@ function loadState() {
   catch { return { oiSnapshots: {}, lastAlerts: {}, tgOffset: 0 }; }
 }
 function saveState(s) { fs.writeFileSync(CONFIG.stateFile, JSON.stringify(s, null, 2)); }
+
+function readJournal(file = CONFIG.journalFile) {
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch { return { rows: [], invalid: 0, missing: true }; }
+  const rows = [];
+  let invalid = 0;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (Number.isFinite(row.time) && row.coin && Number.isFinite(row.markPx) && row.dirs) rows.push(row);
+      else invalid++;
+    } catch { invalid++; }
+  }
+  rows.sort((a, b) => a.time - b.time);
+  return { rows, invalid, missing: false };
+}
+
+function selectNonOverlapping(rows, gapMs) {
+  const selected = [];
+  const lastByCoin = {};
+  for (const row of [...rows].sort((a, b) => a.time - b.time)) {
+    const last = lastByCoin[row.coin] ?? -Infinity;
+    if (row.time - last < gapMs) continue;
+    selected.push(row);
+    lastByCoin[row.coin] = row.time;
+  }
+  return selected;
+}
+
+function journalStatus(file = CONFIG.journalFile) {
+  const { rows, invalid, missing } = readJournal(file);
+  if (missing) { console.log(`No journal found at ${file}`); return; }
+  if (!rows.length) { console.log(`Journal at ${file} has no valid rows (${invalid} malformed).`); return; }
+
+  const first = rows[0].time;
+  const last = rows[rows.length - 1].time;
+  const durationDays = (last - first) / 86400e3;
+  const coinCounts = {};
+  for (const row of rows) coinCounts[row.coin] = (coinCounts[row.coin] || 0) + 1;
+  const witnessCalls = {};
+  for (const witness of ['funding', 'oi', 'liq', 'whales']) {
+    witnessCalls[witness] = rows.filter((r) => Number(r.dirs[witness] || 0) !== 0).length;
+  }
+  const expected = Math.max(1, Math.round(((last - first) / (CONFIG.scanEveryMin * 60e3) + 1) * Object.keys(coinCounts).length));
+  const mature = rows.filter((r) => r.time + CONFIG.backtest.holdHours * 3600e3 < nowMs()).length;
+
+  console.log('Edge Bot research journal');
+  console.log(`File: ${file}`);
+  console.log(`Valid rows: ${rows.length}${invalid ? ` (${invalid} malformed skipped)` : ''}`);
+  console.log(`Period: ${new Date(first).toISOString()} -> ${new Date(last).toISOString()} (${durationDays.toFixed(1)} days)`);
+  console.log(`Approx scan coverage: ${(Math.min(rows.length / expected, 1) * 100).toFixed(1)}% at ${CONFIG.scanEveryMin}m cadence`);
+  console.log(`Mature ${CONFIG.backtest.holdHours}h outcomes: ${mature}`);
+  console.log(`Tracked wallets configured here: ${CONFIG.trackedWallets.length}`);
+  console.log(`Coins: ${Object.entries(coinCounts).map(([coin, n]) => `${coin}=${n}`).join(', ')}`);
+  console.log(`Non-zero witness calls: ${Object.entries(witnessCalls).map(([w, n]) => `${w}=${n}`).join(', ')}`);
+  console.log(`Threshold events (|score| >= ${CONFIG.alertScore}): ${rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore).length}`);
+
+  if (witnessCalls.liq === 0 && witnessCalls.whales === 0) {
+    console.log('READINESS: funding/OI were recorded, but liquidation and whale hypotheses were NOT tested. Configure tracked wallets and collect a new window.');
+  } else if (durationDays < 14) {
+    console.log('READINESS: the full witnesses are present, but this is an early diagnostic window; keep collecting for several weeks.');
+  } else {
+    console.log('READINESS: enough elapsed time for a first evaluation; statistical confidence still depends on non-overlapping signal counts.');
+  }
+}
 
 /* ============================== DATA: HYPERLIQUID ============================== */
 
@@ -174,6 +253,44 @@ async function hlCandles(coin, startMs, endMs = nowMs()) {
     await sleep(120);
   }
   return all;
+}
+
+/**
+ * OKX provides paginated hourly history from recent years. Hyperliquid's candle
+ * endpoint only exposes the most recent 5000 candles (~208 days), so OKX is the
+ * price-history fallback for longer funding backtests. No API key is required.
+ */
+async function okxCandlesForInstrument(instId, startMs, endMs = nowMs()) {
+  const all = [];
+  let cursor = endMs + 1;
+  for (let i = 0; i < 100 && cursor > startMs; i++) {
+    const qs = new URLSearchParams({ instId, bar: '1H', after: String(cursor), limit: '300' });
+    const json = await http(`https://www.okx.com/api/v5/market/history-candles?${qs}`);
+    if (!json || json.code !== '0') throw new Error(`OKX ${instId}: ${json && json.msg || 'invalid response'}`);
+    const batch = Array.isArray(json.data) ? json.data : [];
+    if (!batch.length) break;
+    for (const c of batch) {
+      const time = Number(c[0]);
+      if (time >= startMs && time <= endMs) all.push({ time, open: Number(c[1]), close: Number(c[4]) });
+    }
+    const oldest = Math.min(...batch.map((c) => Number(c[0])));
+    if (!Number.isFinite(oldest) || oldest <= startMs || batch.length < 300) break;
+    cursor = oldest;
+    await sleep(120);
+  }
+  return [...new Map(all.map((c) => [c.time, c])).values()].sort((a, b) => a.time - b.time);
+}
+
+async function okxCandles(coin, startMs, endMs = nowMs()) {
+  const attempts = [`${coin}-USDT-SWAP`, `${coin}-USDT`];
+  const errors = [];
+  for (const instId of attempts) {
+    try {
+      const candles = await okxCandlesForInstrument(instId, startMs, endMs);
+      if (candles.length) return { candles, source: instId.endsWith('-SWAP') ? 'okx-swap' : 'okx-spot' };
+    } catch (e) { errors.push(e.message); }
+  }
+  throw new Error(errors.join(' | ') || `no OKX candles for ${coin}`);
 }
 
 /** Open positions (with exact liquidation prices) for one wallet. */
@@ -412,6 +529,7 @@ function runBacktestCore(funding, candles, params) {
   const candleTimes = candles.map((c) => c.time);
   const trades = [];
   let busyUntil = -Infinity;
+  let skippedNoAdjacentCandle = 0;
 
   const nextCandleIdxAfter = (t) => {
     let lo = 0, hi = candleTimes.length;
@@ -430,8 +548,18 @@ function runBacktestCore(funding, candles, params) {
     if (side === 0 || funding[i].time < busyUntil) continue;
 
     const eIdx = nextCandleIdxAfter(funding[i].time);
-    const xIdx = eIdx + holdHours;
+    // Never pair an old funding signal with the first candle from a much later
+    // limited history window. Entry must be the immediately following hourly bar.
+    if (eIdx >= candles.length || candles[eIdx].time - funding[i].time > 2 * 3600e3) {
+      skippedNoAdjacentCandle++;
+      continue;
+    }
+    const xIdx = nextCandleIdxAfter(candles[eIdx].time + holdHours * 3600e3 - 1);
     if (xIdx >= candles.length) break;
+    if (candles[xIdx].time - candles[eIdx].time > (holdHours + 2) * 3600e3) {
+      skippedNoAdjacentCandle++;
+      continue;
+    }
     const entry = candles[eIdx].open;
     const exit = candles[xIdx].open;
     const gross = side === 1 ? (exit - entry) / entry : (entry - exit) / entry;
@@ -449,6 +577,7 @@ function runBacktestCore(funding, candles, params) {
     hitRate: trades.length ? wins / trades.length : 0,
     avgRet: trades.length ? mean(rets) : 0,
     totalRet: total,
+    skippedNoAdjacentCandle,
   };
 }
 
@@ -461,32 +590,57 @@ async function getSeries(coin, startMs) {
   const file = path.join(__dirname, 'cache', coin + '.json');
   let cache = null;
   try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* no cache yet */ }
-  const covers = cache && cache.funding.length && cache.candles.length
-    && cache.funding[0].time <= startMs + 2 * 3600e3 && cache.candles[0].time <= startMs + 2 * 3600e3;
-  let funding, candles;
-  if (covers) {
+  const fundingCovers = cache && cache.funding && cache.funding.length
+    && cache.funding[0].time <= startMs + 2 * 3600e3;
+  const candleCovers = cache && cache.candles && cache.candles.length
+    && cache.candles[0].time <= startMs + 2 * 3600e3;
+  let funding, candles, candleSource = cache && cache.candleSource || 'hyperliquid';
+  if (fundingCovers) {
     funding = cache.funding.concat(await hlFundingHistory(coin, cache.funding[cache.funding.length - 1].time + 1));
-    candles = cache.candles.concat(await hlCandles(coin, cache.candles[cache.candles.length - 1].time + 1));
   } else {
     funding = await hlFundingHistory(coin, startMs);
-    candles = await hlCandles(coin, startMs);
+  }
+  if (candleCovers) {
+    let tail = [];
+    const tailStart = cache.candles[cache.candles.length - 1].time + 1;
+    if (candleSource.startsWith('okx')) {
+      try { ({ candles: tail } = await okxCandles(coin, tailStart)); } catch { /* no completed tail yet */ }
+    } else {
+      tail = await hlCandles(coin, tailStart);
+    }
+    candles = cache.candles.concat(tail);
+  } else {
+    // Use complete OKX history first for long tests. If the instrument is not
+    // listed there, retain Hyperliquid's limited window; the engine will skip
+    // every signal that lacks an adjacent candle instead of fabricating a match.
+    try {
+      ({ candles, source: candleSource } = await okxCandles(coin, startMs));
+    } catch {
+      candles = await hlCandles(coin, startMs);
+      candleSource = 'hyperliquid-limited';
+    }
   }
   // dedupe by timestamp (an in-progress candle can reappear on the next fetch)
   const uniq = (arr) => [...new Map(arr.map((x) => [x.time, x])).values()].sort((a, b) => a.time - b.time);
   funding = uniq(funding); candles = uniq(candles);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ funding, candles }));
-  return { funding: funding.filter((f) => f.time >= startMs), candles: candles.filter((c) => c.time >= startMs) };
+  fs.writeFileSync(file, JSON.stringify({ funding, candles, candleSource }));
+  return {
+    funding: funding.filter((f) => f.time >= startMs),
+    candles: candles.filter((c) => c.time >= startMs),
+    candleSource,
+  };
 }
 
 async function backtestOne(coin, days) {
   const startMs = nowMs() - days * 24 * 3600e3;
   const pad = CONFIG.fundingZWindow * 3600e3;
-  let funding, candles, source = 'hyperliquid', window = CONFIG.fundingZWindow;
+  let funding, candles, source = 'hyperliquid', candleSource = 'hyperliquid', window = CONFIG.fundingZWindow;
   try {
-    ({ funding, candles } = await getSeries(coin, startMs - pad));
+    ({ funding, candles, candleSource } = await getSeries(coin, startMs - pad));
   } catch (hlErr) {
     source = 'binance';
+    candleSource = 'binance';
     window = 21; // Binance funding is 8-hourly → 21 prints = 7 days
     try {
       funding = await binanceFundingHistory(coin + 'USDT', startMs - pad);
@@ -503,7 +657,11 @@ async function backtestOne(coin, days) {
   });
   const base = [];
   for (let i = 0; i + 24 < candles.length; i += 24) base.push((candles[i + 24].open - candles[i].open) / candles[i].open);
-  return { coin, source, res, base, nFunding: funding.length };
+  return {
+    coin, source, candleSource, res, base, nFunding: funding.length, nCandles: candles.length,
+    candleStart: candles.length ? candles[0].time : null,
+    candleEnd: candles.length ? candles[candles.length - 1].time : null,
+  };
 }
 
 async function backtest(coin, days) {
@@ -524,7 +682,10 @@ async function backtest(coin, days) {
     try {
       process.stdout.write(`Fetching ${c}… `);
       const r = await backtestOne(c, days);
-      console.log(`${r.nFunding} prints (${r.source})`);
+      const coverage = r.candleStart && r.candleEnd
+        ? `${new Date(r.candleStart).toISOString().slice(0, 10)}..${new Date(r.candleEnd).toISOString().slice(0, 10)}`
+        : 'no candle coverage';
+      console.log(`${r.nFunding} funding (${r.source}), ${r.nCandles} candles (${r.candleSource}, ${coverage})`);
       all.push(r);
     } catch (e) { console.log(`skipped: ${e.message}`); }
   }
@@ -537,6 +698,7 @@ async function backtest(coin, days) {
     combined.push(...res.trades.map((t) => t.net));
     allTrades.push(...res.trades.map((t) => ({ ...t, coin: c })));
     console.log(`${c.padEnd(6)} ${String(res.n).padEnd(7)} ${(res.hitRate * 100).toFixed(1).padEnd(6)} ${fmtPct(res.avgRet * 100).padEnd(10)} ${fmtPct(res.totalRet * 100)}`);
+    if (res.skippedNoAdjacentCandle) console.log(`       skipped ${res.skippedNoAdjacentCandle} signals without adjacent hourly price data`);
   }
   if (all.length > 1 && combined.length) {
     const hit = combined.filter((r) => r > 0).length / combined.length;
@@ -560,11 +722,20 @@ async function backtest(coin, days) {
     const totalNoTop3 = combined.reduce((s, r) => s + r, 0) - sorted.slice(0, 3).reduce((s, r) => s + r, 0);
     console.log(`  Median trade: ${fmtPct(median * 100)} (vs mean ${fmtPct(avg * 100)} — big gap = outlier-driven)`);
     console.log(`  Total without top 3 winners: ${fmtPct(totalNoTop3 * 100)}`);
-    // 3. Correlation: same-day signals across coins are ONE bet, not many.
-    const times = allTrades.map((t) => t.time).sort((a, b) => a - b);
-    let clusters = 0;
-    for (let i = 0; i < times.length; i++) if (i === 0 || times[i] - times[i - 1] > 24 * 3600e3) clusters++;
-    console.log(`  Independent signal clusters (>24h apart): ${clusters} of ${allTrades.length} trades — the honest sample size. t-stat overstates confidence by ~sqrt(${(allTrades.length / Math.max(clusters, 1)).toFixed(1)}x).`);
+    // 3. Correlation: same-window signals across coins are one portfolio bet.
+    const ordered = [...allTrades].sort((a, b) => a.time - b.time);
+    const clusters = [];
+    for (const trade of ordered) {
+      const current = clusters[clusters.length - 1];
+      if (!current || trade.time - current.start >= CONFIG.backtest.holdHours * 3600e3) {
+        clusters.push({ start: trade.time, returns: [trade.net] });
+      } else current.returns.push(trade.net);
+    }
+    const clusterReturns = clusters.map((c) => mean(c.returns));
+    const clusterAvg = clusterReturns.length ? mean(clusterReturns) : 0;
+    const clusterSe = clusterReturns.length > 1 ? std(clusterReturns) / Math.sqrt(clusterReturns.length) : 0;
+    const clusterT = clusterSe > 0 ? clusterAvg / clusterSe : 0;
+    console.log(`  Independent ${CONFIG.backtest.holdHours}h signal windows: ${clusters.length} of ${allTrades.length} trades; equal-weight portfolio avg ${fmtPct(clusterAvg * 100)}, cluster t-stat ${clusterT.toFixed(2)}.`);
   }
   const last = all[all.length - 1];
   console.log(`\nBaseline (${last.coin}): avg 24h drift ${fmtPct(mean(last.base) * 100)}, avg |24h move| ${(mean(last.base.map(Math.abs)) * 100).toFixed(2)}%`);
@@ -580,14 +751,15 @@ async function backtest(coin, days) {
  * `holdHours` after each recorded score. This is how the liq-map and whale witnesses
  * get validated — they have no downloadable history, so the bot builds its own.
  */
-async function evaluate() {
-  let lines;
-  try { lines = fs.readFileSync(CONFIG.journalFile, 'utf8').trim().split('\n').map(JSON.parse); }
-  catch { console.log('No journal yet. Run `scan` or `run` for a while first — every scan adds a row.'); return; }
-
+async function evaluate(file = CONFIG.journalFile) {
+  const { rows: journalRows, invalid, missing } = readJournal(file);
+  if (missing || !journalRows.length) {
+    console.log(`No usable journal at ${file}. Run \`scan\` or \`run\` first — every scan adds rows.`);
+    return;
+  }
   const holdMs = CONFIG.backtest.holdHours * 3600e3;
-  const mature = lines.filter((l) => l.time + holdMs < nowMs());
-  console.log(`Journal: ${lines.length} rows, ${mature.length} old enough to evaluate (need ${CONFIG.backtest.holdHours}h of hindsight).`);
+  const mature = journalRows.filter((l) => l.time + holdMs < nowMs());
+  console.log(`Journal: ${journalRows.length} valid rows${invalid ? `, ${invalid} malformed skipped` : ''}; ${mature.length} old enough to evaluate (need ${CONFIG.backtest.holdHours}h of hindsight).`);
   if (!mature.length) return;
 
   // fetch candles per coin covering the journal span, then look up price holdHours later
@@ -607,23 +779,48 @@ async function evaluate() {
   }
   if (!rows.length) { console.log('Nothing evaluable yet.'); return; }
 
-  console.log(`\nForward ${CONFIG.backtest.holdHours}h returns by confluence score (${rows.length} observations):`);
+  // A 15-minute journal evaluated on a 24-hour horizon contains 96 heavily
+  // overlapping outcomes per coin. Treating those as independent would inflate
+  // confidence, so headline statistics use observations at least one full hold
+  // period apart for each coin.
+  const independent = selectNonOverlapping(rows, holdMs);
+  const independentBuckets = new Set(independent.map((r) => Math.floor(r.time / holdMs))).size;
+  console.log(`Usable price outcomes: ${rows.length} raw; ${independent.length} non-overlapping per-coin observations across ${independentBuckets} time buckets.`);
+  console.log(`\nForward ${CONFIG.backtest.holdHours}h returns by confluence score (non-overlapping sample):`);
   console.log('score   n     avg fwd ret   agree%  (agree = price moved in the score\'s direction)');
   for (let s = -4; s <= 4; s++) {
-    const g = rows.filter((r) => r.score === s);
+    const g = independent.filter((r) => r.score === s);
     if (!g.length) continue;
     const avg = mean(g.map((r) => r.fwdRet));
     const agree = s === 0 ? null : g.filter((r) => Math.sign(r.fwdRet) === Math.sign(s)).length / g.length;
     console.log(`${String(s).padStart(3)}    ${String(g.length).padEnd(5)} ${fmtPct(avg * 100).padEnd(13)} ${agree === null ? '—' : (agree * 100).toFixed(0) + '%'}`);
   }
-  console.log('\nWhat you want to see: high |score| rows drifting the way the score points, low scores ~random.');
-  console.log('Also per-witness: a witness whose dir matches the forward move more than ~52-53% of the time is earning its seat.');
+
+  const actionable = selectNonOverlapping(
+    rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore),
+    holdMs,
+  );
+  if (actionable.length) {
+    const net = actionable.map((r) => Math.sign(r.score) * r.fwdRet - 2 * CONFIG.backtest.feePerSide);
+    const avgNet = mean(net);
+    const se = net.length > 1 ? std(net) / Math.sqrt(net.length) : 0;
+    const tStat = se > 0 ? avgNet / se : 0;
+    const buckets = new Set(actionable.map((r) => Math.floor(r.time / holdMs))).size;
+    console.log(`\nActionable confluence (|score| >= ${CONFIG.alertScore}, after ${(2 * CONFIG.backtest.feePerSide * 100).toFixed(2)}% round-trip fees):`);
+    console.log(`  ${actionable.length} non-overlapping per-coin signals in ${buckets} time buckets; hit ${(net.filter((r) => r > 0).length / net.length * 100).toFixed(1)}%; avg ${fmtPct(avgNet * 100)}; t-stat ${tStat.toFixed(2)}`);
+  } else {
+    console.log(`\nActionable confluence: no non-overlapping |score| >= ${CONFIG.alertScore} events.`);
+  }
+
+  console.log('\nPer-witness results use non-overlapping non-zero calls:');
   for (const w of ['funding', 'oi', 'liq', 'whales']) {
-    const g = rows.filter((r) => r.dirs[w] !== 0);
+    const g = selectNonOverlapping(rows.filter((r) => Number(r.dirs[w] || 0) !== 0), holdMs);
     if (!g.length) { console.log(`  ${w}: no non-zero calls yet`); continue; }
     const agree = g.filter((r) => Math.sign(r.fwdRet) === r.dirs[w]).length / g.length;
-    console.log(`  ${w}: ${g.length} calls, ${(agree * 100).toFixed(1)}% agreement with forward move`);
+    const directional = g.map((r) => r.dirs[w] * r.fwdRet - 2 * CONFIG.backtest.feePerSide);
+    console.log(`  ${w}: ${g.length} calls, ${(agree * 100).toFixed(1)}% agreement, avg directional return after fees ${fmtPct(mean(directional) * 100)}`);
   }
+  console.log('\nInterpretation: one week is a pipeline check, not proof. Look for repeatable results over several non-overlapping time buckets and market regimes.');
 }
 
 /* ============================== SELFTEST (audit mode) ============================== */
@@ -661,6 +858,10 @@ function selftest() {
   check('entry is NEXT candle after print (h=301), price still 100', t.entry === 100);
   check('exit 24 candles later, ~3% lower', t.exit < 97.5);
   check('net return ≈ +3% - fees (profitable short)', t.net > 0.025 && t.net < 0.031);
+
+  const limitedCandles = candles.filter((c) => c.time >= t0 + 350 * 3600e3);
+  const limited = runBacktestCore(funding, limitedCandles, { window: 168, zThreshold: 2, holdHours: 24, feePerSide: 0.0005, minAbsRate: 0.00004 });
+  check('signal before available candle history is skipped, never paired to a later candle', limited.n === 0 && limited.skippedNoAdjacentCandle === 1);
 
   // 3. Lookahead trap: price falls BEFORE the funding print instead of after.
   //    A leaky engine would still "profit". A correct one enters after the drop and makes ~0.
@@ -707,6 +908,18 @@ function selftest() {
   const whale = whaleWitness([{ size: 10, notionalUsd: 1_000_000 }, { size: -1, notionalUsd: 100_000 }]);
   check('whales net long → argues UP', whale.dir === 1);
 
+  // 6. Forward evaluation must not count overlapping 24h outcomes as
+  //    independent observations. The gap is enforced separately per coin.
+  console.log('[6] non-overlapping forward samples');
+  const day = 24 * 3600e3;
+  const overlap = [
+    { coin: 'BTC', time: 0 }, { coin: 'ETH', time: 0 },
+    { coin: 'BTC', time: day - 1 }, { coin: 'BTC', time: day },
+  ];
+  const sampled = selectNonOverlapping(overlap, day);
+  check('overlapping BTC outcome is dropped', sampled.filter((r) => r.coin === 'BTC').length === 2);
+  check('sampling gap is tracked independently per coin', sampled.filter((r) => r.coin === 'ETH').length === 1);
+
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED ✔' : failed + ' CHECK(S) FAILED ✘'}`);
   process.exit(failed === 0 ? 0 : 1);
 }
@@ -717,11 +930,12 @@ const [, , cmd, arg1, arg2] = process.argv;
 (async () => {
   if (cmd === 'selftest') selftest();
   else if (cmd === 'backtest') await backtest((arg1 || 'BTC').toUpperCase(), parseInt(arg2 || '120', 10));
-  else if (cmd === 'evaluate') await evaluate();
+  else if (cmd === 'evaluate') await evaluate(arg1 || CONFIG.journalFile);
+  else if (cmd === 'journal-status') journalStatus(arg1 || CONFIG.journalFile);
   else if (cmd === 'scan') {
     const results = await scanOnce(loadState(), { silent: false });
     console.log(results.map(formatReport).join('\n\n'));
   }
   else if (cmd === 'run') await runLive();
-  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | evaluate | selftest]');
+  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | evaluate [FILE] | selftest]');
 })().catch((e) => { console.error('fatal:', e.message); process.exit(1); });

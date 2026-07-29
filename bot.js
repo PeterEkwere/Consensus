@@ -47,6 +47,7 @@ const OKX_BASE = "https://www.okx.com/api/v5/market";
 const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
 const ALERTS_FILE = path.join(__dirname, "alerts.json");
+const RISK_REWARD_RATIO = 3;
 
 // Default universe: major, liquid pairs. Majors are tracked on futures so that
 // SHORT setups are actionable and TradingView links open the perpetual chart.
@@ -698,8 +699,9 @@ function scoreSide(side, ctx) {
     ? Math.max(0, Math.min(ctx.levels.support || last.close - ctx.volatility, last.close - ctx.volatility * 1.25))
     : Math.max(ctx.levels.resistance || last.close + ctx.volatility, last.close + ctx.volatility * 1.25);
   const risk = Math.abs(last.close - stop) || ctx.volatility;
-  const target1 = long ? last.close + risk * 1.5 : last.close - risk * 1.5;
-  const target2 = long ? last.close + risk * 2.2 : last.close - risk * 2.2;
+  const target = long
+    ? last.close + risk * RISK_REWARD_RATIO
+    : last.close - risk * RISK_REWARD_RATIO;
   const entryLow = long ? last.close - ctx.volatility * 0.25 : last.close - ctx.volatility * 0.1;
   const entryHigh = long ? last.close + ctx.volatility * 0.1 : last.close + ctx.volatility * 0.25;
 
@@ -711,8 +713,8 @@ function scoreSide(side, ctx) {
     entryLow,
     entryHigh,
     stop,
-    target1,
-    target2,
+    target,
+    riskRewardRatio: RISK_REWARD_RATIO,
     rsi: ctx.rsiValue,
     trend: ctx.trend,
     confirmations,
@@ -856,7 +858,7 @@ function formatSignal(signal) {
     `<b>Trade Map</b>\n` +
     `Entry zone: <code>${fmtPrice(signal.entryLow)} - ${fmtPrice(signal.entryHigh)}</code>\n` +
     `Invalidation: <code>${fmtPrice(signal.stop)}</code>\n` +
-    `Targets: <code>${fmtPrice(signal.target1)}</code> / <code>${fmtPrice(signal.target2)}</code>\n\n` +
+    `Target (${signal.riskRewardRatio}:1 RR): <code>${fmtPrice(signal.target)}</code>\n\n` +
     `<b>TradingView</b>\n<code>${esc(signal.tvSymbol)}</code>\n\n` +
     `<i>Manual execution only. This is a scanner alert, not financial advice.</i>`;
 }
@@ -902,6 +904,7 @@ function statusText() {
     `Timeframes: <b>5m / 15m / 1h</b>\n` +
     `1h trend gate: <b>${state.useHtfGate ? "on" : "off"}</b>\n` +
     `Threshold: <b>${state.alertThreshold}%</b>\n` +
+    `Reward/risk: <b>${RISK_REWARD_RATIO}:1</b>\n` +
     `Cooldown: <b>${state.cooldownMinutes} min</b>\n` +
     `Scan interval: <b>${state.scanIntervalMinutes} min</b>\n` +
     `Min 24h volume: <b>${fmtUsd(state.minQuoteVolume24h)}</b>\n\n` +
@@ -950,8 +953,8 @@ function sampleSignal() {
     entryLow: 64180,
     entryHigh: 64320,
     stop: 63680,
-    target1: 65100,
-    target2: 65850,
+    target: 65960,
+    riskRewardRatio: RISK_REWARD_RATIO,
     rsi: 58.4,
     trend: "bullish",
     trendH1: "bullish",

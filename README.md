@@ -4,6 +4,7 @@ Lean, single-file crypto market-structure Telegram alert bot for **major exchang
 
 - Tracks curated major pairs on **OKX Spot and Futures** (perpetuals). OKX is used because it is reachable from regions where Binance/Bybit are geo-blocked.
 - Multi-timeframe consensus: **5m + 15m + 1h**. 15m is the setup timeframe, 1h gates the direction, 5m confirms momentum.
+- Alert trade maps use a single **3:1 reward-to-risk target** measured from the signal price to invalidation.
 - Pairs shown as **TradingView symbols** with chart links. No wallet, no trading, no API key.
 
 ## Local Setup

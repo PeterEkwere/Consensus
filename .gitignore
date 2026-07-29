@@ -6,4 +6,4 @@ node_modules/
 npm-debug.log*
 edge-bot/cache/
 edge-bot/state.json
-edge-bot/journal.jsonl
+edge-bot/*journal*.jsonl
