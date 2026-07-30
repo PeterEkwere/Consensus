@@ -40,6 +40,7 @@ async function run() {
 
   try {
     assert.strictEqual(viewer.enabled, true);
+    assert.strictEqual(viewer.createSetup({ ...signal, target: undefined }), null, "incomplete legacy alerts must be rejected");
     const link = new URL(viewer.createSetup(signal));
     const id = link.pathname.split("/").pop();
     const signature = link.searchParams.get("sig");

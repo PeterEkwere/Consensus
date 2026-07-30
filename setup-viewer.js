@@ -161,6 +161,9 @@ function createSetupViewer(options) {
 
   function createSetup(signal) {
     if (!enabled) return null;
+    const requiredPrices = [signal.price, signal.entryLow, signal.entryHigh, signal.stop, signal.target];
+    if (!requiredPrices.every((value) => Number.isFinite(Number(value)) && Number(value) > 0)) return null;
+    if (!/^(long|short)$/.test(signal.side) || !signal.symbol || !signal.tvSymbol) return null;
     const id = crypto.randomBytes(16).toString("hex");
     const now = Date.now();
     const setup = {
