@@ -5,7 +5,8 @@ Lean, single-file crypto market-structure Telegram alert bot for **major exchang
 - Tracks curated major pairs on **OKX Spot and Futures** (perpetuals). OKX is used because it is reachable from regions where Binance/Bybit are geo-blocked.
 - Multi-timeframe consensus: **5m + 15m + 1h**. 15m is the setup timeframe, 1h gates the direction, 5m confirms momentum.
 - Alert trade maps use a single **3:1 reward-to-risk target** measured from the signal price to invalidation.
-- Pairs shown as **TradingView symbols** with chart links. No wallet, no trading, no API key.
+- Every alert can include a one-tap **View complete setup** page that draws fresh candlesticks, the entry zone, invalidation and 3R target.
+- The setup viewer is read-only. No wallet, no trading and no exchange API key.
 
 ## Local Setup
 
@@ -20,6 +21,16 @@ Put the Telegram bot token in `.env`:
 ```bash
 TELEGRAM_BOT_TOKEN=your_token_here
 ```
+
+To enable one-tap setup pages, give the bot a public HTTPS URL and signing secret:
+
+```bash
+SETUP_VIEWER_BASE_URL=https://charts.example.com
+SETUP_VIEWER_SECRET=generate_with_openssl_rand_hex_32
+SETUP_VIEWER_PORT=3080
+```
+
+The viewer listens only on `127.0.0.1`; expose it through an HTTPS reverse proxy. A starting Nginx configuration is in `deploy/consensus-setup-viewer.nginx.conf.example`.
 
 Run a dry scan (prints candidates, sends nothing):
 
@@ -100,6 +111,8 @@ npm install
 pm2 restart consensus-reaper
 pm2 logs consensus-reaper --lines 100
 ```
+
+Use `/testalert` in Telegram to receive a sample alert with the one-tap setup button.
 
 Useful commands:
 

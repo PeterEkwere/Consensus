@@ -33,6 +33,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const TelegramBot = require("node-telegram-bot-api");
+const { createSetupViewer } = require("./setup-viewer");
 
 loadLocalEnv(path.join(__dirname, ".env"));
 
@@ -47,7 +48,11 @@ const OKX_BASE = "https://www.okx.com/api/v5/market";
 const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
 const ALERTS_FILE = path.join(__dirname, "alerts.json");
+const SETUPS_FILE = path.join(__dirname, "setups.json");
 const RISK_REWARD_RATIO = 3;
+const SETUP_VIEWER_BASE_URL = process.env.SETUP_VIEWER_BASE_URL || "";
+const SETUP_VIEWER_SECRET = process.env.SETUP_VIEWER_SECRET || "";
+const SETUP_VIEWER_PORT = Number(process.env.SETUP_VIEWER_PORT || 3080);
 
 // Default universe: major, liquid pairs. Majors are tracked on futures so that
 // SHORT setups are actionable and TradingView links open the perpetual chart.
@@ -86,6 +91,13 @@ if (!dryRun && !TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 const bot = dryRun ? null : new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: !sendTest });
+const setupViewer = createSetupViewer({
+  baseUrl: SETUP_VIEWER_BASE_URL,
+  secret: SETUP_VIEWER_SECRET,
+  port: SETUP_VIEWER_PORT,
+  setupsFile: SETUPS_FILE,
+  fetchCandles: (pair, frame, limit) => fetchCandles(pair, frame, limit),
+});
 
 // ---------------------------------------------------------------------------
 // State + env helpers
@@ -803,21 +815,31 @@ function markCooldown(signal) {
 
 async function broadcastSignal(signal) {
   const text = formatSignal(signal);
+  const setupUrl = setupViewer.createSetup(signal);
   const alert = {
     sentAt: new Date().toISOString(),
     chatIds: state.alertChatIds,
+    setupUrl,
     signal,
   };
   appendJsonArray(ALERTS_FILE, alert, 500);
   for (const chatId of state.alertChatIds) {
-    await sendHtml(chatId, text, {
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "Open chart", url: signal.url },
-        ]],
-      },
-    });
+    await sendSignalAlert(chatId, signal, text, setupUrl);
   }
+}
+
+function signalButtons(signal, setupUrl) {
+  const row = [];
+  if (setupUrl) row.push({ text: "View complete setup", url: setupUrl });
+  row.push({ text: "Open TradingView", url: signal.url });
+  return { inline_keyboard: [row] };
+}
+
+function sendSignalAlert(chatId, signal, text = formatSignal(signal), setupUrl = null) {
+  const viewerUrl = setupUrl || setupViewer.createSetup(signal);
+  return sendHtml(chatId, text, {
+    reply_markup: signalButtons(signal, viewerUrl),
+  });
 }
 
 function formatSignal(signal) {
@@ -911,6 +933,7 @@ function statusText() {
     `<b>Alerts</b>\n` +
     `Chats: ${chats || "none"}\n` +
     `Stored alerts: <b>${alerts.length}</b>\n` +
+    `One-tap setup viewer: <b>${setupViewer.enabled ? "on" : "off"}</b>\n` +
     `Last scan: <code>${esc(lastScan)}</code>`;
 }
 
@@ -921,7 +944,7 @@ function commandPattern(command) {
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
     `Multi-timeframe market-structure scanner for major ${EXCHANGE} pairs.\n` +
-    `Spot and futures, 5m/15m/1h consensus, TradingView links.\n\n` +
+    `Spot and futures, 5m/15m/1h consensus, one-tap trade maps.\n\n` +
     `<b>Commands</b>\n` +
     `/id - show this chat id\n` +
     `/activate - owner only, enable alerts here\n` +
@@ -937,7 +960,7 @@ function helpText() {
     `/removepair BTCUSDT - owner only\n` +
     `/resetpairs - owner only, restore defaults\n` +
     `/threshold 65 - owner only\n\n` +
-    `<i>Manual execution only. No wallet. No trading.</i>`;
+    `<i>The setup viewer is read-only. No wallet. No automatic trading.</i>`;
 }
 
 function sampleSignal() {
@@ -1110,10 +1133,11 @@ if (!dryRun) {
     }
   });
 
-  bot.onText(commandPattern("testalert"), (msg) => {
+  bot.onText(commandPattern("testalert"), async (msg) => {
     if (!ownerGuard(msg)) return;
-    const text = `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n` + formatSignal(sampleSignal());
-    sendHtml(msg.chat.id, text);
+    const signal = sampleSignal();
+    const text = `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n` + formatSignal(signal);
+    await sendSignalAlert(msg.chat.id, signal, text);
   });
 
   bot.on("polling_error", (err) => {
@@ -1126,8 +1150,15 @@ if (!dryRun) {
 // ---------------------------------------------------------------------------
 
 async function autoLoop() {
+  if (!dryRun && setupViewer.enabled) {
+    const address = await setupViewer.start();
+    console.log(`Setup viewer listening on ${address.address}:${address.port}`);
+  } else if (!dryRun) {
+    console.log("Setup viewer disabled. Configure SETUP_VIEWER_BASE_URL and SETUP_VIEWER_SECRET to enable it.");
+  }
   if (sendTest) {
-    await sendToOwner(`<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(sampleSignal())}`);
+    const signal = sampleSignal();
+    await sendSignalAlert(DEFAULT_OWNER_CHAT_ID, signal, `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(signal)}`);
     console.log("Test alert sent to Telegram.");
     return;
   }

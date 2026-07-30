@@ -19,6 +19,7 @@
  *   node edge-bot.js scan               one-shot scan, prints to console (no Telegram needed)
  *   node edge-bot.js run                live loop: scans + Telegram alerts + interactive commands
  *   node edge-bot.js backtest BTC 120   backtest funding-fade signal on real data (coin, days)
+ *   node edge-bot.js evaluate-scalps    evaluate journal outcomes after 5/15/60 minutes
  *   node edge-bot.js selftest           verify the engine math on synthetic data (audit mode)
  *
  * Setup (only needed for `run`):
@@ -37,18 +38,25 @@ const CONFIG = {
   trackedWallets: [                       // Hyperliquid addresses you follow (fill from the leaderboard:
     // '0x...',                           //   https://app.hyperliquid.xyz/leaderboard — pick consistent PnL, not one lucky trade)
   ],
+  liquidityProviderWallets: [             // high-turnover / possible market makers, researched separately
+    // '0x...',                           // never added directly to the directional witness
+  ],
   fundingZWindow: 168,                    // hours of history used to judge "extreme" funding (7 days)
   fundingZThreshold: 2.0,                 // |z| >= this => funding witness testifies
   minAbsFundingRate: 0.00004,             // AND |rate| must exceed this (0.004%/h ≈ 35% APR).
                                           // Guards against junk z-scores when funding flatlines at the
                                           // default rate and window variance collapses to ~0.
-  oiChangePct: 5,                         // OI up >= this % in 24h => OI witness testifies
-  liqClusterBandPct: 10,                  // look for liq clusters within +/- this % of price
-  liqClusterBinPct: 0.5,                  // cluster bin width
-  minClusterUsd: 100_000,                 // ignore clusters smaller than this (raise once wallets are added)
+  oiLookbackMin: 60,                      // scalping context: compare OI with one hour ago
+  oiChangePct: 1,                         // OI up >= this % in the lookback => confirms crowding
+  liqClusterBandPct: 2,                   // scalping map: nearby clusters within +/- 2%
+  liqClusterBinPct: 0.25,                 // tighter cluster bins for short-horizon moves
+  minClusterUsd: 250_000,                 // ignore small cohort liquidation pockets
   alertScore: 3,                          // witnesses needed to send an alert (max 4)
-  alertCooldownMin: 240,                  // don't repeat the same coin+direction alert within this window
-  scanEveryMin: 15,                       // live loop scan interval
+  alertCooldownMin: 30,                   // scalps can reset faster than swing setups
+  scanEveryMin: 1,                        // observe directional scalpers before their books change
+  scalpEvaluationMin: [5, 15, 60],        // forward horizons for journal-based scalp research
+  liquidityFlowLookbackMin: [5, 15],      // measure high-turnover cohort inventory changes
+  minLiquidityFlowUsd: 250_000,           // ignore tiny aggregate inventory changes
   backtest: {
     holdHours: 24,                        // exit N hours after entry
     feePerSide: 0.0005,                   // taker fee assumption (0.05% per side)
@@ -75,6 +83,15 @@ const envWallets = (process.env.HYPERLIQUID_TRACKED_WALLETS || '')
   .map((w) => w.trim().toLowerCase())
   .filter((w) => /^0x[a-f0-9]{40}$/.test(w));
 CONFIG.trackedWallets = [...new Set([...CONFIG.trackedWallets, ...envWallets])];
+const envLiquidityWallets = (process.env.HYPERLIQUID_LP_WALLETS || '')
+  .split(',')
+  .map((w) => w.trim().toLowerCase())
+  .filter((w) => /^0x[a-f0-9]{40}$/.test(w));
+const directionalWalletSet = new Set(CONFIG.trackedWallets);
+CONFIG.liquidityProviderWallets = [...new Set([
+  ...CONFIG.liquidityProviderWallets,
+  ...envLiquidityWallets,
+])].filter((w) => !directionalWalletSet.has(w));
 
 // A separate Edge Bot token avoids two processes competing for Telegram
 // getUpdates. The shared token remains a send-only fallback when no Edge Bot
@@ -149,6 +166,24 @@ function selectNonOverlapping(rows, gapMs) {
   return selected;
 }
 
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function observedJournalCadenceMin(rows) {
+  const lastByCoin = {};
+  const gaps = [];
+  for (const row of rows) {
+    const last = lastByCoin[row.coin];
+    if (Number.isFinite(last) && row.time > last) gaps.push((row.time - last) / 60e3);
+    lastByCoin[row.coin] = row.time;
+  }
+  return median(gaps);
+}
+
 function journalStatus(file = CONFIG.journalFile) {
   const { rows, invalid, missing } = readJournal(file);
   if (missing) { console.log(`No journal found at ${file}`); return; }
@@ -163,16 +198,21 @@ function journalStatus(file = CONFIG.journalFile) {
   for (const witness of ['funding', 'oi', 'liq', 'whales']) {
     witnessCalls[witness] = rows.filter((r) => Number(r.dirs[witness] || 0) !== 0).length;
   }
-  const expected = Math.max(1, Math.round(((last - first) / (CONFIG.scanEveryMin * 60e3) + 1) * Object.keys(coinCounts).length));
+  const observedCadenceMin = observedJournalCadenceMin(rows) || CONFIG.scanEveryMin;
+  const expected = Math.max(1, Math.round(((last - first) / (observedCadenceMin * 60e3) + 1) * Object.keys(coinCounts).length));
   const mature = rows.filter((r) => r.time + CONFIG.backtest.holdHours * 3600e3 < nowMs()).length;
+  const walletSamples = rows.filter((r) => r.walletDirs && Object.keys(r.walletDirs).length).length;
+  const liquiditySamples = rows.filter((r) => r.lpWalletUsd && Object.keys(r.lpWalletUsd).length).length;
 
   console.log('Edge Bot research journal');
   console.log(`File: ${file}`);
   console.log(`Valid rows: ${rows.length}${invalid ? ` (${invalid} malformed skipped)` : ''}`);
   console.log(`Period: ${new Date(first).toISOString()} -> ${new Date(last).toISOString()} (${durationDays.toFixed(1)} days)`);
-  console.log(`Approx scan coverage: ${(Math.min(rows.length / expected, 1) * 100).toFixed(1)}% at ${CONFIG.scanEveryMin}m cadence`);
+  console.log(`Observed scan cadence: ${observedCadenceMin.toFixed(1)}m (current config ${CONFIG.scanEveryMin}m)`);
+  console.log(`Approx scan coverage: ${(Math.min(rows.length / expected, 1) * 100).toFixed(1)}% at observed cadence`);
   console.log(`Mature ${CONFIG.backtest.holdHours}h outcomes: ${mature}`);
-  console.log(`Tracked wallets configured here: ${CONFIG.trackedWallets.length}`);
+  console.log(`Directional scalper wallets configured here: ${CONFIG.trackedWallets.length} (${walletSamples} rows with active positions)`);
+  console.log(`High-turnover/LP wallets configured here: ${CONFIG.liquidityProviderWallets.length} (${liquiditySamples} rows with active inventory)`);
   console.log(`Coins: ${Object.entries(coinCounts).map(([coin, n]) => `${coin}=${n}`).join(', ')}`);
   console.log(`Non-zero witness calls: ${Object.entries(witnessCalls).map(([w, n]) => `${w}=${n}`).join(', ')}`);
   console.log(`Threshold events (|score| >= ${CONFIG.alertScore}): ${rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore).length}`);
@@ -300,6 +340,7 @@ async function hlPositions(wallet) {
     .map((p) => p.position)
     .filter((p) => p && parseFloat(p.szi) !== 0)
     .map((p) => ({
+      wallet,
       coin: p.coin,
       size: parseFloat(p.szi),                       // >0 long, <0 short
       notionalUsd: Math.abs(parseFloat(p.positionValue)),
@@ -354,13 +395,13 @@ function fundingWitness(currentRate, history) {
   return { dir: 0, z, note: `funding normal (z=${Math.abs(z) > 100 ? 'flat-window' : z.toFixed(1)})` };
 }
 
-function oiWitness(oiNow, oi24hAgo, fundingDir) {
-  if (!oi24hAgo) return { dir: 0, note: 'OI: no 24h-ago snapshot yet (needs a day of running)' };
-  const chg = ((oiNow - oi24hAgo) / oi24hAgo) * 100;
+function oiWitness(oiNow, oiPast, fundingDir) {
+  if (!oiPast) return { dir: 0, note: `OI: no ${CONFIG.oiLookbackMin}m-old snapshot yet` };
+  const chg = ((oiNow - oiPast) / oiPast) * 100;
   // Rising OI only *confirms* the funding witness (the crowd is growing). It has no direction alone.
   if (chg >= CONFIG.oiChangePct && fundingDir !== 0)
-    return { dir: fundingDir, chg, note: `OI up ${fmtPct(chg)} in 24h → crowd growing, confirms funding` };
-  return { dir: 0, chg, note: `OI ${fmtPct(chg)} in 24h` };
+    return { dir: fundingDir, chg, note: `OI up ${fmtPct(chg)} in ${CONFIG.oiLookbackMin}m → crowd growing, confirms funding` };
+  return { dir: 0, chg, note: `OI ${fmtPct(chg)} in ${CONFIG.oiLookbackMin}m` };
 }
 
 function liqMapWitness(positions, markPx) {
@@ -377,55 +418,118 @@ function liqMapWitness(positions, markPx) {
   for (const [bin, usd] of Object.entries(bins)) {
     if (usd >= CONFIG.minClusterUsd && (!best || usd > best.usd)) best = { bin: Number(bin), usd };
   }
-  if (!best) return { dir: 0, note: 'liq map: no significant cluster in band (add tracked wallets)' };
+  if (!best) return { dir: 0, usd: 0, pct: null, note: 'liq map: no significant tracked-wallet cluster in scalp band' };
   const pct = best.bin * CONFIG.liqClusterBinPct;
   const dir = pct < 0 ? -1 : 1; // magnet below → argues down; above → argues up
-  return { dir, note: `liq cluster ${fmtUsd(best.usd)} at ${fmtPct(pct, 1)} from price → magnet ${dir < 0 ? 'BELOW' : 'ABOVE'}` };
+  return { dir, usd: best.usd, pct, note: `liq cluster ${fmtUsd(best.usd)} at ${fmtPct(pct, 2)} from price → magnet ${dir < 0 ? 'BELOW' : 'ABOVE'}` };
 }
 
 function whaleWitness(positions) {
   if (!positions.length) return { dir: 0, note: 'whales: no tracked positions (add wallets to CONFIG)' };
-  let net = 0, gross = 0;
-  for (const p of positions) { net += Math.sign(p.size) * p.notionalUsd; gross += p.notionalUsd; }
-  const lean = net / gross; // -1..1
-  if (lean > 0.3) return { dir: 1, note: `whales net LONG ${fmtUsd(net)} → argues UP` };
-  if (lean < -0.3) return { dir: -1, note: `whales net SHORT ${fmtUsd(-net)} → argues DOWN` };
-  return { dir: 0, note: 'whales roughly balanced' };
+  // Equal-wallet voting prevents one very large account from dictating the
+  // entire cohort. Liquidation clustering remains notional-weighted because
+  // actual dollars at risk are what matter there.
+  const votes = new Map();
+  for (const p of positions) votes.set(p.wallet, Math.sign(p.size));
+  const dirs = [...votes.values()];
+  const longs = dirs.filter((d) => d > 0).length;
+  const shorts = dirs.filter((d) => d < 0).length;
+  const lean = (longs - shorts) / dirs.length;
+  const dir = dirs.length >= 2 && Math.abs(lean) + Number.EPSILON >= 1 / 3 ? Math.sign(lean) : 0;
+  return {
+    dir, longs, shorts, active: dirs.length, lean,
+    note: dir === 0
+      ? `scalper cohort mixed (${longs}L/${shorts}S)`
+      : `scalper cohort ${dir > 0 ? 'LONG' : 'SHORT'} (${longs}L/${shorts}S) → argues ${dir > 0 ? 'UP' : 'DOWN'}`,
+  };
+}
+
+/**
+ * High-turnover accounts are deliberately not a directional witness. A maker
+ * can become long by absorbing aggressive sells, so the useful hypothesis is
+ * whether a large inventory CHANGE predicts continuation or mean reversion.
+ */
+function liquidityProviderFlow(positions, snapshots, time) {
+  const currentByWallet = {};
+  for (const p of positions) {
+    currentByWallet[p.wallet] = (currentByWallet[p.wallet] || 0)
+      + Math.sign(p.size) * p.notionalUsd;
+  }
+  const netUsd = Object.values(currentByWallet).reduce((sum, n) => sum + n, 0);
+  const grossUsd = Object.values(currentByWallet).reduce((sum, n) => sum + Math.abs(n), 0);
+  const flowUsd = {};
+  for (const minutes of CONFIG.liquidityFlowLookbackMin) {
+    const past = snapshots.filter((s) => s.time <= time - minutes * 60e3).pop();
+    flowUsd[minutes] = past ? netUsd - past.netUsd : null;
+  }
+  snapshots.push({ time, netUsd, grossUsd });
+  const keepMs = (Math.max(...CONFIG.liquidityFlowLookbackMin) * 4 + 5) * 60e3;
+  while (snapshots.length && snapshots[0].time < time - keepMs) snapshots.shift();
+  return {
+    netUsd,
+    grossUsd,
+    active: Object.keys(currentByWallet).length,
+    flowUsd,
+    walletUsd: currentByWallet,
+  };
 }
 
 /* ============================== SCAN + CONFLUENCE ============================== */
 
+const liveFundingCache = {};
+async function liveFundingHistory(coin) {
+  const cached = liveFundingCache[coin];
+  if (cached && nowMs() - cached.time < 55 * 60e3) return cached.rows;
+  const rows = await hlFundingHistory(coin, nowMs() - (CONFIG.fundingZWindow + 2) * 3600e3);
+  liveFundingCache[coin] = { time: nowMs(), rows };
+  return rows;
+}
+
 async function scanOnce(state, { silent = false } = {}) {
   const market = await hlMarketState();
 
-  // whale positions, grouped by coin
+  // Keep directional scalpers and high-turnover liquidity providers separate.
   const byCoin = {};
-  for (const w of CONFIG.trackedWallets) {
+  const lpByCoin = {};
+  const walletTypes = new Map([
+    ...CONFIG.trackedWallets.map((w) => [w, 'directional']),
+    ...CONFIG.liquidityProviderWallets.map((w) => [w, 'liquidity']),
+  ]);
+  for (const [w, walletType] of walletTypes) {
     try {
-      for (const p of await hlPositions(w)) (byCoin[p.coin] = byCoin[p.coin] || []).push(p);
+      for (const p of await hlPositions(w)) {
+        const target = walletType === 'directional' ? byCoin : lpByCoin;
+        (target[p.coin] = target[p.coin] || []).push(p);
+      }
     } catch (e) { if (!silent) console.error(`wallet ${w}: ${e.message}`); }
     await sleep(120);
   }
+  state.liquidityProviderSnapshots = state.liquidityProviderSnapshots || {};
 
   const results = [];
   for (const coin of CONFIG.coins) {
     const m = market[coin];
     if (!m) continue;
 
-    const hist = await hlFundingHistory(coin, nowMs() - (CONFIG.fundingZWindow + 2) * 3600e3);
+    const hist = await liveFundingHistory(coin);
     const wFund = fundingWitness(m.funding, hist.slice(0, -1)); // window excludes latest print
 
     const snaps = state.oiSnapshots[coin] || [];
-    const dayAgo = snaps.filter((s) => s.time <= nowMs() - 24 * 3600e3).pop();
-    const wOi = oiWitness(m.oiUsd, dayAgo ? dayAgo.oiUsd : null, wFund.dir);
+    const oiPast = snaps.filter((s) => s.time <= nowMs() - CONFIG.oiLookbackMin * 60e3).pop();
+    const wOi = oiWitness(m.oiUsd, oiPast ? oiPast.oiUsd : null, wFund.dir);
 
     const positions = byCoin[coin] || [];
+    const lpPositions = lpByCoin[coin] || [];
     const wLiq = liqMapWitness(positions, m.markPx);
     const wWhale = whaleWitness(positions);
+    const scanTime = nowMs();
+    const lpSnaps = state.liquidityProviderSnapshots[coin] || [];
+    const lpFlow = liquidityProviderFlow(lpPositions, lpSnaps, scanTime);
+    state.liquidityProviderSnapshots[coin] = lpSnaps;
 
-    // record OI snapshot (keep 3 days)
-    snaps.push({ time: nowMs(), oiUsd: m.oiUsd });
-    state.oiSnapshots[coin] = snaps.filter((s) => s.time > nowMs() - 72 * 3600e3);
+    // Keep enough minute snapshots for several one-hour comparisons.
+    snaps.push({ time: scanTime, oiUsd: m.oiUsd });
+    state.oiSnapshots[coin] = snaps.filter((s) => s.time > scanTime - Math.max(6 * 3600e3, CONFIG.oiLookbackMin * 4 * 60e3));
 
     const witnesses = { funding: wFund, oi: wOi, liq: wLiq, whales: wWhale };
     const score = wFund.dir + wOi.dir + wLiq.dir + wWhale.dir;
@@ -434,8 +538,22 @@ async function scanOnce(state, { silent = false } = {}) {
     // journal every scan (not just alerts) — this is the dataset that makes
     // the liq-map and whale witnesses backtestable via `evaluate`
     fs.appendFileSync(CONFIG.journalFile, JSON.stringify({
-      time: nowMs(), coin, markPx: m.markPx, score,
+      time: scanTime, coin, markPx: m.markPx, score,
       dirs: { funding: wFund.dir, oi: wOi.dir, liq: wLiq.dir, whales: wWhale.dir },
+      meta: {
+        oiChangePct: Number.isFinite(wOi.chg) ? wOi.chg : null,
+        liqUsd: wLiq.usd || 0,
+        liqDistancePct: wLiq.pct,
+        whaleLongs: wWhale.longs || 0,
+        whaleShorts: wWhale.shorts || 0,
+        lpNetUsd: lpFlow.netUsd,
+        lpGrossUsd: lpFlow.grossUsd,
+        lpActive: lpFlow.active,
+        lpFlow5mUsd: lpFlow.flowUsd[5] ?? null,
+        lpFlow15mUsd: lpFlow.flowUsd[15] ?? null,
+      },
+      walletDirs: Object.fromEntries(positions.map((p) => [p.wallet, Math.sign(p.size)])),
+      lpWalletUsd: lpFlow.walletUsd,
     }) + '\n');
   }
   saveState(state);
@@ -823,6 +941,130 @@ async function evaluate(file = CONFIG.journalFile) {
   console.log('\nInterpretation: one week is a pipeline check, not proof. Look for repeatable results over several non-overlapping time buckets and market regimes.');
 }
 
+function journalForwardRows(journalRows, horizonMs, toleranceMs = Math.max(2, CONFIG.scanEveryMin * 2) * 60e3) {
+  const byCoin = {};
+  for (const row of journalRows) (byCoin[row.coin] = byCoin[row.coin] || []).push(row);
+  const outcomes = [];
+  for (const entries of Object.values(byCoin)) {
+    entries.sort((a, b) => a.time - b.time);
+    for (const row of entries) {
+      const target = row.time + horizonMs;
+      let lo = 0, hi = entries.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (entries[mid].time < target) lo = mid + 1;
+        else hi = mid;
+      }
+      const later = entries[lo];
+      if (!later || later.time - target > toleranceMs) continue;
+      outcomes.push({
+        ...row,
+        outcomeTime: later.time,
+        fwdRet: (later.markPx - row.markPx) / row.markPx,
+      });
+    }
+  }
+  return outcomes;
+}
+
+function printScalpSample(label, rows, directionOf) {
+  if (!rows.length) {
+    console.log(`  ${label}: no qualifying calls yet`);
+    return;
+  }
+  const gross = rows.map((row) => directionOf(row) * row.fwdRet);
+  const net = gross.map((ret) => ret - 2 * CONFIG.backtest.feePerSide);
+  console.log(
+    `  ${label}: ${rows.length} calls, ${(gross.filter((r) => r > 0).length / gross.length * 100).toFixed(1)}% directional agreement, `
+    + `avg gross ${fmtPct(mean(gross) * 100)}, avg after fees ${fmtPct(mean(net) * 100)}`,
+  );
+}
+
+/**
+ * Short-horizon evaluation uses prices already captured in the journal. That
+ * avoids another market-data source, candle-boundary mismatch, and lookahead.
+ */
+function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEvaluationMin) {
+  const { rows: journalRows, invalid, missing } = readJournal(file);
+  if (missing || !journalRows.length) {
+    console.log(`No usable journal at ${file}. Run \`scan\` or \`run\` first — every scan adds rows.`);
+    return;
+  }
+  const observedCadence = observedJournalCadenceMin(journalRows) || CONFIG.scanEveryMin;
+  const toleranceMs = Math.max(2, observedCadence * 0.35) * 60e3;
+  console.log(
+    `Scalper journal: ${journalRows.length} valid rows${invalid ? `, ${invalid} malformed skipped` : ''}; `
+    + `observed cadence ${observedCadence.toFixed(1)}m. Prices come from later journal snapshots.`,
+  );
+
+  for (const horizonMin of horizonsMin) {
+    const horizonMs = horizonMin * 60e3;
+    const rows = journalForwardRows(journalRows, horizonMs, toleranceMs);
+    const independent = selectNonOverlapping(rows, horizonMs);
+    const buckets = new Set(independent.map((r) => Math.floor(r.time / horizonMs))).size;
+    console.log(`\n=== ${horizonMin}m forward outcome: ${rows.length} raw; ${independent.length} non-overlapping per-coin calls across ${buckets} time buckets ===`);
+    if (!independent.length) {
+      console.log('No matched future journal prices yet.');
+      continue;
+    }
+
+    console.log('score   n     avg fwd ret   agree%');
+    for (let score = -4; score <= 4; score++) {
+      const group = independent.filter((r) => r.score === score);
+      if (!group.length) continue;
+      const avg = mean(group.map((r) => r.fwdRet));
+      const agree = score === 0
+        ? '—'
+        : `${(group.filter((r) => Math.sign(r.fwdRet) === Math.sign(score)).length / group.length * 100).toFixed(0)}%`;
+      console.log(`${String(score).padStart(3)}    ${String(group.length).padEnd(5)} ${fmtPct(avg * 100).padEnd(13)} ${agree}`);
+    }
+
+    const actionable = selectNonOverlapping(
+      rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore),
+      horizonMs,
+    );
+    console.log(`\nConfluence (|score| >= ${CONFIG.alertScore}):`);
+    printScalpSample('combined', actionable, (r) => Math.sign(r.score));
+
+    console.log('Witnesses:');
+    for (const witness of ['funding', 'oi', 'liq', 'whales']) {
+      const group = selectNonOverlapping(
+        rows.filter((r) => Number(r.dirs[witness] || 0) !== 0),
+        horizonMs,
+      );
+      printScalpSample(witness, group, (r) => Number(r.dirs[witness]));
+    }
+
+    const wallets = [...new Set(rows.flatMap((r) => Object.keys(r.walletDirs || {})))];
+    console.log('Directional scalper wallets:');
+    if (!wallets.length) console.log('  no wallet positions were journaled');
+    for (const wallet of wallets) {
+      const group = selectNonOverlapping(
+        rows.filter((r) => Number((r.walletDirs || {})[wallet] || 0) !== 0),
+        horizonMs,
+      );
+      const short = `${wallet.slice(0, 8)}…${wallet.slice(-4)}`;
+      printScalpSample(short, group, (r) => Number(r.walletDirs[wallet]));
+    }
+
+    console.log('High-turnover/LP inventory-flow hypotheses (unscored):');
+    for (const lookbackMin of CONFIG.liquidityFlowLookbackMin) {
+      const key = `lpFlow${lookbackMin}mUsd`;
+      const group = selectNonOverlapping(
+        rows.filter((r) => Math.abs(Number((r.meta || {})[key])) >= CONFIG.minLiquidityFlowUsd),
+        horizonMs,
+      );
+      if (!group.length) {
+        console.log(`  ${lookbackMin}m flow: no changes >= ${fmtUsd(CONFIG.minLiquidityFlowUsd)} yet`);
+        continue;
+      }
+      printScalpSample(`${lookbackMin}m flow CONTINUATION`, group, (r) => Math.sign(Number(r.meta[key])));
+      printScalpSample(`${lookbackMin}m flow FADE`, group, (r) => -Math.sign(Number(r.meta[key])));
+    }
+  }
+  console.log('\nInterpretation: compare gross and fee-adjusted returns. Do not promote LP flow into the alert score until one orientation repeats across many independent time buckets and market regimes.');
+}
+
 /* ============================== SELFTEST (audit mode) ============================== */
 
 function selftest() {
@@ -903,10 +1145,20 @@ function selftest() {
   check('extreme positive funding argues DOWN', fundingWitness(0.01, hist).dir === -1);
   check('extreme negative funding argues UP', fundingWitness(-0.01, hist).dir === 1);
   check('normal funding is neutral', fundingWitness(0.00001, hist).dir === 0);
-  const liq = liqMapWitness([{ coin: 'BTC', size: 5, notionalUsd: 500_000, liqPx: 97 }], 100);
+  const liq = liqMapWitness([{ coin: 'BTC', size: 5, notionalUsd: 500_000, liqPx: 98.5 }], 100);
   check('big liq cluster below price → magnet argues DOWN', liq.dir === -1);
-  const whale = whaleWitness([{ size: 10, notionalUsd: 1_000_000 }, { size: -1, notionalUsd: 100_000 }]);
-  check('whales net long → argues UP', whale.dir === 1);
+  const whale = whaleWitness([
+    { wallet: '0x1', size: 10, notionalUsd: 1_000_000 },
+    { wallet: '0x2', size: 2, notionalUsd: 200_000 },
+    { wallet: '0x3', size: -1, notionalUsd: 100_000 },
+  ]);
+  check('two long wallets vs one short → argues UP', whale.dir === 1);
+  const equalVote = whaleWitness([
+    { wallet: '0x1', size: 100, notionalUsd: 10_000_000 },
+    { wallet: '0x2', size: -1, notionalUsd: 100_000 },
+    { wallet: '0x3', size: -1, notionalUsd: 100_000 },
+  ]);
+  check('wallet vote is equal-weighted: two shorts beat one huge long', equalVote.dir === -1);
 
   // 6. Forward evaluation must not count overlapping 24h outcomes as
   //    independent observations. The gap is enforced separately per coin.
@@ -920,6 +1172,31 @@ function selftest() {
   check('overlapping BTC outcome is dropped', sampled.filter((r) => r.coin === 'BTC').length === 2);
   check('sampling gap is tracked independently per coin', sampled.filter((r) => r.coin === 'ETH').length === 1);
 
+  // 7. The scalp evaluator must use a later journal snapshot at the requested
+  //    horizon, without pairing to a distant row after a collection gap.
+  console.log('[7] journal-based scalp outcomes');
+  const minute = 60e3;
+  const scalpRows = [
+    { coin: 'BTC', time: 0, markPx: 100, score: 1, dirs: {} },
+    { coin: 'BTC', time: 5 * minute, markPx: 102, score: 0, dirs: {} },
+    { coin: 'ETH', time: 0, markPx: 100, score: -1, dirs: {} },
+    { coin: 'ETH', time: 20 * minute, markPx: 80, score: 0, dirs: {} },
+  ];
+  const scalpOutcomes = journalForwardRows(scalpRows, 5 * minute, 2 * minute);
+  check('5m BTC outcome uses the 5m journal price', scalpOutcomes.length === 1 && Math.abs(scalpOutcomes[0].fwdRet - 0.02) < 1e-9);
+  check('distant ETH row is rejected instead of creating lookahead', !scalpOutcomes.some((r) => r.coin === 'ETH'));
+
+  // 8. High-turnover cohort inventory is recorded as a raw change and never
+  //    converted to a directional witness before forward evidence exists.
+  console.log('[8] high-turnover inventory flow');
+  const lpSnaps = [{ time: 0, netUsd: 100_000, grossUsd: 300_000 }];
+  const lp = liquidityProviderFlow([
+    { wallet: '0xmaker1', size: 1, notionalUsd: 500_000 },
+    { wallet: '0xmaker2', size: -1, notionalUsd: 100_000 },
+  ], lpSnaps, 15 * minute);
+  check('aggregate signed inventory is computed', lp.netUsd === 400_000 && lp.grossUsd === 600_000);
+  check('15m inventory change is computed without assigning direction', lp.flowUsd[15] === 300_000 && lp.dir === undefined);
+
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED ✔' : failed + ' CHECK(S) FAILED ✘'}`);
   process.exit(failed === 0 ? 0 : 1);
 }
@@ -931,11 +1208,16 @@ const [, , cmd, arg1, arg2] = process.argv;
   if (cmd === 'selftest') selftest();
   else if (cmd === 'backtest') await backtest((arg1 || 'BTC').toUpperCase(), parseInt(arg2 || '120', 10));
   else if (cmd === 'evaluate') await evaluate(arg1 || CONFIG.journalFile);
+  else if (cmd === 'evaluate-scalps') {
+    const horizons = arg2 ? [parseInt(arg2, 10)] : CONFIG.scalpEvaluationMin;
+    if (horizons.some((n) => !Number.isFinite(n) || n <= 0)) throw new Error('scalp horizon must be a positive number of minutes');
+    evaluateScalps(arg1 || CONFIG.journalFile, horizons);
+  }
   else if (cmd === 'journal-status') journalStatus(arg1 || CONFIG.journalFile);
   else if (cmd === 'scan') {
     const results = await scanOnce(loadState(), { silent: false });
     console.log(results.map(formatReport).join('\n\n'));
   }
   else if (cmd === 'run') await runLive();
-  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | evaluate [FILE] | selftest]');
+  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | evaluate [FILE] | evaluate-scalps [FILE] [MINUTES] | selftest]');
 })().catch((e) => { console.error('fatal:', e.message); process.exit(1); });
