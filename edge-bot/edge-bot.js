@@ -51,12 +51,18 @@ const CONFIG = {
   liqClusterBandPct: 2,                   // scalping map: nearby clusters within +/- 2%
   liqClusterBinPct: 0.25,                 // tighter cluster bins for short-horizon moves
   minClusterUsd: 250_000,                 // ignore small cohort liquidation pockets
+  minLiqResearchUsd: 50_000,              // unscored lower bar used only to measure the hypothesis
   alertScore: 3,                          // witnesses needed to send an alert (max 4)
   alertCooldownMin: 30,                   // scalps can reset faster than swing setups
   scanEveryMin: 1,                        // observe directional scalpers before their books change
   scalpEvaluationMin: [5, 15, 60],        // forward horizons for journal-based scalp research
+  walletFlowLookbackMin: [5, 15],         // real size changes, not repeated held-position snapshots
+  minWalletFlowUsd: 25_000,               // research threshold; never contributes to alerts yet
   liquidityFlowLookbackMin: [5, 15],      // measure high-turnover cohort inventory changes
-  minLiquidityFlowUsd: 250_000,           // ignore tiny aggregate inventory changes
+  minLiquidityFlowUsd: 50_000,            // research threshold on actual size delta, not USD repricing
+  oiResearchLookbackMin: 15,               // unscored price/OI regime research for scalps
+  minOiResearchChangePct: 0.25,
+  minPriceResearchChangePct: 0.10,
   backtest: {
     holdHours: 24,                        // exit N hours after entry
     feePerSide: 0.0005,                   // taker fee assumption (0.05% per side)
@@ -201,6 +207,7 @@ function journalStatus(file = CONFIG.journalFile) {
   const observedCadenceMin = observedJournalCadenceMin(rows) || CONFIG.scanEveryMin;
   const expected = Math.max(1, Math.round(((last - first) / (observedCadenceMin * 60e3) + 1) * Object.keys(coinCounts).length));
   const mature = rows.filter((r) => r.time + CONFIG.backtest.holdHours * 3600e3 < nowMs()).length;
+  const sizeFlowRows = rows.filter((r) => Number(r.schemaVersion || 1) >= 2).length;
   const walletSamples = rows.filter((r) => r.walletDirs && Object.keys(r.walletDirs).length).length;
   const liquiditySamples = rows.filter((r) => r.lpWalletUsd && Object.keys(r.lpWalletUsd).length).length;
 
@@ -211,14 +218,20 @@ function journalStatus(file = CONFIG.journalFile) {
   console.log(`Observed scan cadence: ${observedCadenceMin.toFixed(1)}m (current config ${CONFIG.scanEveryMin}m)`);
   console.log(`Approx scan coverage: ${(Math.min(rows.length / expected, 1) * 100).toFixed(1)}% at observed cadence`);
   console.log(`Mature ${CONFIG.backtest.holdHours}h outcomes: ${mature}`);
+  console.log(`Size-flow schema rows: ${sizeFlowRows} (need these to test real wallet inventory changes)`);
   console.log(`Directional scalper wallets configured here: ${CONFIG.trackedWallets.length} (${walletSamples} rows with active positions)`);
   console.log(`High-turnover/LP wallets configured here: ${CONFIG.liquidityProviderWallets.length} (${liquiditySamples} rows with active inventory)`);
   console.log(`Coins: ${Object.entries(coinCounts).map(([coin, n]) => `${coin}=${n}`).join(', ')}`);
   console.log(`Non-zero witness calls: ${Object.entries(witnessCalls).map(([w, n]) => `${w}=${n}`).join(', ')}`);
   console.log(`Threshold events (|score| >= ${CONFIG.alertScore}): ${rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore).length}`);
 
+  const silentWitnesses = Object.entries(witnessCalls).filter(([, count]) => count === 0).map(([name]) => name);
   if (witnessCalls.liq === 0 && witnessCalls.whales === 0) {
     console.log('READINESS: funding/OI were recorded, but liquidation and whale hypotheses were NOT tested. Configure tracked wallets and collect a new window.');
+  } else if (sizeFlowRows === 0) {
+    console.log('READINESS: held-position data exists, but real wallet size changes were not recorded in this legacy window.');
+  } else if (silentWitnesses.length) {
+    console.log(`READINESS: pipeline healthy, but ${silentWitnesses.join('/')} produced no calls. Keep size-flow research unscored until event counts mature.`);
   } else if (durationDays < 14) {
     console.log('READINESS: the full witnesses are present, but this is an early diagnostic window; keep collecting for several weeks.');
   } else {
@@ -414,14 +427,29 @@ function liqMapWitness(positions, markPx) {
     const bin = Math.round(dist / (CONFIG.liqClusterBinPct / 100));
     bins[bin] = (bins[bin] || 0) + p.notionalUsd;
   }
-  let best = null;
+  let best = null, observed = null;
   for (const [bin, usd] of Object.entries(bins)) {
+    if (!observed || usd > observed.usd) observed = { bin: Number(bin), usd };
     if (usd >= CONFIG.minClusterUsd && (!best || usd > best.usd)) best = { bin: Number(bin), usd };
   }
-  if (!best) return { dir: 0, usd: 0, pct: null, note: 'liq map: no significant tracked-wallet cluster in scalp band' };
+  if (!best) return {
+    dir: 0,
+    usd: 0,
+    pct: null,
+    observedUsd: observed ? observed.usd : 0,
+    observedPct: observed ? observed.bin * CONFIG.liqClusterBinPct : null,
+    note: 'liq map: no significant tracked-wallet cluster in scalp band',
+  };
   const pct = best.bin * CONFIG.liqClusterBinPct;
   const dir = pct < 0 ? -1 : 1; // magnet below → argues down; above → argues up
-  return { dir, usd: best.usd, pct, note: `liq cluster ${fmtUsd(best.usd)} at ${fmtPct(pct, 2)} from price → magnet ${dir < 0 ? 'BELOW' : 'ABOVE'}` };
+  return {
+    dir,
+    usd: best.usd,
+    pct,
+    observedUsd: best.usd,
+    observedPct: pct,
+    note: `liq cluster ${fmtUsd(best.usd)} at ${fmtPct(pct, 2)} from price → magnet ${dir < 0 ? 'BELOW' : 'ABOVE'}`,
+  };
 }
 
 function whaleWitness(positions) {
@@ -447,30 +475,38 @@ function whaleWitness(positions) {
 /**
  * High-turnover accounts are deliberately not a directional witness. A maker
  * can become long by absorbing aggressive sells, so the useful hypothesis is
- * whether a large inventory CHANGE predicts continuation or mean reversion.
+ * whether a large position-size CHANGE predicts continuation or mean reversion.
+ * Measuring base size avoids mistaking mark-price movement for wallet flow.
  */
-function liquidityProviderFlow(positions, snapshots, time) {
-  const currentByWallet = {};
+function cohortPositionFlow(positions, snapshots, time, markPx, lookbacks, complete = true) {
+  const walletSizes = {};
   for (const p of positions) {
-    currentByWallet[p.wallet] = (currentByWallet[p.wallet] || 0)
-      + Math.sign(p.size) * p.notionalUsd;
+    walletSizes[p.wallet] = (walletSizes[p.wallet] || 0) + p.size;
   }
-  const netUsd = Object.values(currentByWallet).reduce((sum, n) => sum + n, 0);
-  const grossUsd = Object.values(currentByWallet).reduce((sum, n) => sum + Math.abs(n), 0);
+  const netSize = Object.values(walletSizes).reduce((sum, n) => sum + n, 0);
+  const grossSize = Object.values(walletSizes).reduce((sum, n) => sum + Math.abs(n), 0);
   const flowUsd = {};
-  for (const minutes of CONFIG.liquidityFlowLookbackMin) {
+  for (const minutes of lookbacks) {
     const past = snapshots.filter((s) => s.time <= time - minutes * 60e3).pop();
-    flowUsd[minutes] = past ? netUsd - past.netUsd : null;
+    flowUsd[minutes] = complete && past && Number.isFinite(past.netSize)
+      ? (netSize - past.netSize) * markPx
+      : null;
   }
-  snapshots.push({ time, netUsd, grossUsd });
-  const keepMs = (Math.max(...CONFIG.liquidityFlowLookbackMin) * 4 + 5) * 60e3;
-  while (snapshots.length && snapshots[0].time < time - keepMs) snapshots.shift();
+  if (complete) {
+    snapshots.push({ time, netSize, grossSize });
+    const keepMs = (Math.max(...lookbacks) * 4 + 5) * 60e3;
+    while (snapshots.length && snapshots[0].time < time - keepMs) snapshots.shift();
+  }
   return {
-    netUsd,
-    grossUsd,
-    active: Object.keys(currentByWallet).length,
+    available: complete,
+    netSize,
+    grossSize,
+    netUsd: netSize * markPx,
+    grossUsd: grossSize * markPx,
+    active: Object.keys(walletSizes).length,
     flowUsd,
-    walletUsd: currentByWallet,
+    walletSizes,
+    walletUsd: Object.fromEntries(Object.entries(walletSizes).map(([wallet, size]) => [wallet, size * markPx])),
   };
 }
 
@@ -491,6 +527,8 @@ async function scanOnce(state, { silent = false } = {}) {
   // Keep directional scalpers and high-turnover liquidity providers separate.
   const byCoin = {};
   const lpByCoin = {};
+  const directionalObserved = new Set();
+  const liquidityObserved = new Set();
   const walletTypes = new Map([
     ...CONFIG.trackedWallets.map((w) => [w, 'directional']),
     ...CONFIG.liquidityProviderWallets.map((w) => [w, 'liquidity']),
@@ -501,10 +539,12 @@ async function scanOnce(state, { silent = false } = {}) {
         const target = walletType === 'directional' ? byCoin : lpByCoin;
         (target[p.coin] = target[p.coin] || []).push(p);
       }
+      (walletType === 'directional' ? directionalObserved : liquidityObserved).add(w);
     } catch (e) { if (!silent) console.error(`wallet ${w}: ${e.message}`); }
     await sleep(120);
   }
   state.liquidityProviderSnapshots = state.liquidityProviderSnapshots || {};
+  state.directionalWalletSnapshots = state.directionalWalletSnapshots || {};
 
   const results = [];
   for (const coin of CONFIG.coins) {
@@ -524,11 +564,42 @@ async function scanOnce(state, { silent = false } = {}) {
     const wWhale = whaleWitness(positions);
     const scanTime = nowMs();
     const lpSnaps = state.liquidityProviderSnapshots[coin] || [];
-    const lpFlow = liquidityProviderFlow(lpPositions, lpSnaps, scanTime);
+    const lpFlow = cohortPositionFlow(
+      lpPositions,
+      lpSnaps,
+      scanTime,
+      m.markPx,
+      CONFIG.liquidityFlowLookbackMin,
+      liquidityObserved.size === CONFIG.liquidityProviderWallets.length,
+    );
     state.liquidityProviderSnapshots[coin] = lpSnaps;
+    const walletSnaps = state.directionalWalletSnapshots[coin] || [];
+    const walletFlow = cohortPositionFlow(
+      positions,
+      walletSnaps,
+      scanTime,
+      m.markPx,
+      CONFIG.walletFlowLookbackMin,
+      directionalObserved.size === CONFIG.trackedWallets.length,
+    );
+    state.directionalWalletSnapshots[coin] = walletSnaps;
+
+    const oiResearchPast = snaps.filter((s) => s.time <= scanTime - CONFIG.oiResearchLookbackMin * 60e3).pop();
+    const oiResearchChangePct = oiResearchPast
+      ? ((m.oiUsd - oiResearchPast.oiUsd) / oiResearchPast.oiUsd) * 100
+      : null;
+    const priceResearchChangePct = oiResearchPast && Number.isFinite(oiResearchPast.markPx)
+      ? ((m.markPx - oiResearchPast.markPx) / oiResearchPast.markPx) * 100
+      : null;
+    const oiPriceDir = Number.isFinite(oiResearchChangePct)
+      && Number.isFinite(priceResearchChangePct)
+      && Math.abs(oiResearchChangePct) >= CONFIG.minOiResearchChangePct
+      && Math.abs(priceResearchChangePct) >= CONFIG.minPriceResearchChangePct
+      ? Math.sign(priceResearchChangePct)
+      : 0;
 
     // Keep enough minute snapshots for several one-hour comparisons.
-    snaps.push({ time: scanTime, oiUsd: m.oiUsd });
+    snaps.push({ time: scanTime, oiUsd: m.oiUsd, markPx: m.markPx });
     state.oiSnapshots[coin] = snaps.filter((s) => s.time > scanTime - Math.max(6 * 3600e3, CONFIG.oiLookbackMin * 4 * 60e3));
 
     const witnesses = { funding: wFund, oi: wOi, liq: wLiq, whales: wWhale };
@@ -538,22 +609,37 @@ async function scanOnce(state, { silent = false } = {}) {
     // journal every scan (not just alerts) — this is the dataset that makes
     // the liq-map and whale witnesses backtestable via `evaluate`
     fs.appendFileSync(CONFIG.journalFile, JSON.stringify({
+      schemaVersion: 2,
       time: scanTime, coin, markPx: m.markPx, score,
       dirs: { funding: wFund.dir, oi: wOi.dir, liq: wLiq.dir, whales: wWhale.dir },
       meta: {
         oiChangePct: Number.isFinite(wOi.chg) ? wOi.chg : null,
         liqUsd: wLiq.usd || 0,
         liqDistancePct: wLiq.pct,
+        liqObservedUsd: wLiq.observedUsd || 0,
+        liqObservedDistancePct: wLiq.observedPct,
         whaleLongs: wWhale.longs || 0,
         whaleShorts: wWhale.shorts || 0,
+        walletNetUsd: walletFlow.netUsd,
+        walletGrossUsd: walletFlow.grossUsd,
+        walletSizeFlow5mUsd: walletFlow.flowUsd[5] ?? null,
+        walletSizeFlow15mUsd: walletFlow.flowUsd[15] ?? null,
         lpNetUsd: lpFlow.netUsd,
         lpGrossUsd: lpFlow.grossUsd,
         lpActive: lpFlow.active,
-        lpFlow5mUsd: lpFlow.flowUsd[5] ?? null,
-        lpFlow15mUsd: lpFlow.flowUsd[15] ?? null,
+        lpSizeFlow5mUsd: lpFlow.flowUsd[5] ?? null,
+        lpSizeFlow15mUsd: lpFlow.flowUsd[15] ?? null,
+        oiResearchChangePct,
+        priceResearchChangePct,
+        oiPriceDir,
       },
       walletDirs: Object.fromEntries(positions.map((p) => [p.wallet, Math.sign(p.size)])),
+      walletSizes: walletFlow.walletSizes,
+      walletUsd: walletFlow.walletUsd,
+      walletMissing: CONFIG.trackedWallets.filter((wallet) => !directionalObserved.has(wallet)),
+      lpWalletSizes: lpFlow.walletSizes,
       lpWalletUsd: lpFlow.walletUsd,
+      lpWalletMissing: CONFIG.liquidityProviderWallets.filter((wallet) => !liquidityObserved.has(wallet)),
     }) + '\n');
   }
   saveState(state);
@@ -996,6 +1082,7 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
     `Scalper journal: ${journalRows.length} valid rows${invalid ? `, ${invalid} malformed skipped` : ''}; `
     + `observed cadence ${observedCadence.toFixed(1)}m. Prices come from later journal snapshots.`,
   );
+  console.log(`Real size-flow rows (schema v2+): ${journalRows.filter((r) => Number(r.schemaVersion || 1) >= 2).length}. Legacy USD-flow fields are excluded from flow conclusions.`);
 
   for (const horizonMin of horizonsMin) {
     const horizonMs = horizonMin * 60e3;
@@ -1036,7 +1123,7 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
     }
 
     const wallets = [...new Set(rows.flatMap((r) => Object.keys(r.walletDirs || {})))];
-    console.log('Directional scalper wallets:');
+    console.log('Held-position baseline (context only, not an entry trigger):');
     if (!wallets.length) console.log('  no wallet positions were journaled');
     for (const wallet of wallets) {
       const group = selectNonOverlapping(
@@ -1047,11 +1134,28 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
       printScalpSample(short, group, (r) => Number(r.walletDirs[wallet]));
     }
 
-    console.log('High-turnover/LP inventory-flow hypotheses (unscored):');
-    for (const lookbackMin of CONFIG.liquidityFlowLookbackMin) {
-      const key = `lpFlow${lookbackMin}mUsd`;
+    console.log('Directional-wallet real SIZE-flow hypotheses (unscored):');
+    for (const lookbackMin of CONFIG.walletFlowLookbackMin) {
+      const key = `walletSizeFlow${lookbackMin}mUsd`;
       const group = selectNonOverlapping(
-        rows.filter((r) => Math.abs(Number((r.meta || {})[key])) >= CONFIG.minLiquidityFlowUsd),
+        rows.filter((r) => Number(r.schemaVersion || 1) >= 2
+          && Math.abs(Number((r.meta || {})[key])) >= CONFIG.minWalletFlowUsd),
+        horizonMs,
+      );
+      if (!group.length) {
+        console.log(`  ${lookbackMin}m size flow: no changes >= ${fmtUsd(CONFIG.minWalletFlowUsd)} yet`);
+        continue;
+      }
+      printScalpSample(`${lookbackMin}m size flow CONTINUATION`, group, (r) => Math.sign(Number(r.meta[key])));
+      printScalpSample(`${lookbackMin}m size flow FADE`, group, (r) => -Math.sign(Number(r.meta[key])));
+    }
+
+    console.log('High-turnover/LP real SIZE-flow hypotheses (unscored):');
+    for (const lookbackMin of CONFIG.liquidityFlowLookbackMin) {
+      const key = `lpSizeFlow${lookbackMin}mUsd`;
+      const group = selectNonOverlapping(
+        rows.filter((r) => Number(r.schemaVersion || 1) >= 2
+          && Math.abs(Number((r.meta || {})[key])) >= CONFIG.minLiquidityFlowUsd),
         horizonMs,
       );
       if (!group.length) {
@@ -1061,6 +1165,22 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
       printScalpSample(`${lookbackMin}m flow CONTINUATION`, group, (r) => Math.sign(Number(r.meta[key])));
       printScalpSample(`${lookbackMin}m flow FADE`, group, (r) => -Math.sign(Number(r.meta[key])));
     }
+
+    console.log('Price/OI regime hypothesis (unscored continuation):');
+    const oiPrice = selectNonOverlapping(
+      rows.filter((r) => Number(r.schemaVersion || 1) >= 2 && Number((r.meta || {}).oiPriceDir || 0) !== 0),
+      horizonMs,
+    );
+    printScalpSample(`${CONFIG.oiResearchLookbackMin}m price+OI expansion`, oiPrice, (r) => Number(r.meta.oiPriceDir));
+
+    console.log('Observed liquidation-pocket hypothesis (unscored):');
+    const observedLiq = selectNonOverlapping(
+      rows.filter((r) => Number(r.schemaVersion || 1) >= 2
+        && Number((r.meta || {}).liqObservedUsd || 0) >= CONFIG.minLiqResearchUsd
+        && Number((r.meta || {}).liqObservedDistancePct || 0) !== 0),
+      horizonMs,
+    );
+    printScalpSample(`pockets >= ${fmtUsd(CONFIG.minLiqResearchUsd)}`, observedLiq, (r) => Math.sign(Number(r.meta.liqObservedDistancePct)));
   }
   console.log('\nInterpretation: compare gross and fee-adjusted returns. Do not promote LP flow into the alert score until one orientation repeats across many independent time buckets and market regimes.');
 }
@@ -1147,6 +1267,9 @@ function selftest() {
   check('normal funding is neutral', fundingWitness(0.00001, hist).dir === 0);
   const liq = liqMapWitness([{ coin: 'BTC', size: 5, notionalUsd: 500_000, liqPx: 98.5 }], 100);
   check('big liq cluster below price → magnet argues DOWN', liq.dir === -1);
+  const weakLiq = liqMapWitness([{ coin: 'BTC', size: 1, notionalUsd: 100_000, liqPx: 99 }], 100);
+  check('smaller liquidation pocket is recorded for research but stays neutral',
+    weakLiq.dir === 0 && weakLiq.observedUsd === 100_000 && weakLiq.observedPct === -1);
   const whale = whaleWitness([
     { wallet: '0x1', size: 10, notionalUsd: 1_000_000 },
     { wallet: '0x2', size: 2, notionalUsd: 200_000 },
@@ -1189,13 +1312,18 @@ function selftest() {
   // 8. High-turnover cohort inventory is recorded as a raw change and never
   //    converted to a directional witness before forward evidence exists.
   console.log('[8] high-turnover inventory flow');
-  const lpSnaps = [{ time: 0, netUsd: 100_000, grossUsd: 300_000 }];
-  const lp = liquidityProviderFlow([
-    { wallet: '0xmaker1', size: 1, notionalUsd: 500_000 },
+  const lpSnaps = [{ time: 0, netSize: 1, grossSize: 3 }];
+  const lp = cohortPositionFlow([
+    { wallet: '0xmaker1', size: 5, notionalUsd: 500_000 },
     { wallet: '0xmaker2', size: -1, notionalUsd: 100_000 },
-  ], lpSnaps, 15 * minute);
-  check('aggregate signed inventory is computed', lp.netUsd === 400_000 && lp.grossUsd === 600_000);
-  check('15m inventory change is computed without assigning direction', lp.flowUsd[15] === 300_000 && lp.dir === undefined);
+  ], lpSnaps, 15 * minute, 100, [5, 15], true);
+  check('aggregate signed size and marked inventory are computed',
+    lp.netSize === 4 && lp.grossSize === 6 && lp.netUsd === 400 && lp.grossUsd === 600);
+  check('15m inventory change is computed without assigning direction', lp.flowUsd[15] === 300 && lp.dir === undefined);
+  const snapshotsBeforeFailure = lpSnaps.length;
+  const unavailable = cohortPositionFlow([], lpSnaps, 16 * minute, 100, [5, 15], false);
+  check('incomplete wallet fetch cannot create a fake zero-position flow',
+    unavailable.available === false && unavailable.flowUsd[5] === null && lpSnaps.length === snapshotsBeforeFailure);
 
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED ✔' : failed + ' CHECK(S) FAILED ✘'}`);
   process.exit(failed === 0 ? 0 : 1);
