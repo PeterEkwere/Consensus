@@ -46,13 +46,27 @@ const CONFIG = {
   minAbsFundingRate: 0.00004,             // AND |rate| must exceed this (0.004%/h ≈ 35% APR).
                                           // Guards against junk z-scores when funding flatlines at the
                                           // default rate and window variance collapses to ~0.
-  oiLookbackMin: 60,                      // scalping context: compare OI with one hour ago
-  oiChangePct: 1,                         // OI up >= this % in the lookback => confirms crowding
+  oiLookbackMin: 15,                      // scalping context: OI expansion over the last 15m
+  oiChangePct: 0.25,                      // |OI change| >= this % in the lookback => crowd is building
+  minPriceChangePct: 0.10,                // ...and price must have actually moved to give that build a direction
   liqClusterBandPct: 2,                   // scalping map: nearby clusters within +/- 2%
   liqClusterBinPct: 0.25,                 // tighter cluster bins for short-horizon moves
   minClusterUsd: 250_000,                 // ignore small cohort liquidation pockets
   minLiqResearchUsd: 50_000,              // unscored lower bar used only to measure the hypothesis
-  alertScore: 3,                          // witnesses needed to send an alert (max 4)
+  // Only these witnesses contribute to the score. `liq` is computed and journaled
+  // but stays unscored: it is built from the tracked cohort's own liquidation
+  // prices, so it samples 8 accounts rather than the market. Across 63,900 scans
+  // it never produced a single pocket of any size, which means a scored `liq`
+  // is a permanent zero that silently raises the bar for every other witness.
+  scoredWitnesses: ['funding', 'oi', 'whales'],
+  researchWitnesses: ['liq'],
+  alertScore: 2,                          // agreeing witnesses needed to alert (max 3)
+  // Collect and journal, but never send trade alerts. The threshold above is now
+  // actually reachable (it was not before), and on the first 4.8 days of real
+  // data the score is noise: 47% agreement, gross returns ~20x smaller than the
+  // 0.10% round-trip fee. Set false only when a witness has earned it on
+  // out-of-sample data. Alerts are logged either way so the stream stays visible.
+  researchMode: true,
   alertCooldownMin: 30,                   // scalps can reset faster than swing setups
   scanEveryMin: 1,                        // observe directional scalpers before their books change
   scalpEvaluationMin: [5, 15, 60],        // forward horizons for journal-based scalp research
@@ -60,9 +74,6 @@ const CONFIG = {
   minWalletFlowUsd: 25_000,               // research threshold; never contributes to alerts yet
   liquidityFlowLookbackMin: [5, 15],      // measure high-turnover cohort inventory changes
   minLiquidityFlowUsd: 50_000,            // research threshold on actual size delta, not USD repricing
-  oiResearchLookbackMin: 15,               // unscored price/OI regime research for scalps
-  minOiResearchChangePct: 0.25,
-  minPriceResearchChangePct: 0.10,
   backtest: {
     holdHours: 24,                        // exit N hours after entry
     feePerSide: 0.0005,                   // taker fee assumption (0.05% per side)
@@ -172,6 +183,23 @@ function selectNonOverlapping(rows, gapMs) {
   return selected;
 }
 
+function mapValues(obj, fn) {
+  return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, fn(v)]));
+}
+
+/**
+ * Always derive the score from `dirs` rather than trusting a row's stored
+ * `score`. Journals span schema versions with different scoring rules, and
+ * recomputing keeps every row on today's definition so old and new windows
+ * stay comparable. A witness that is absent from an older row counts as
+ * silent, which is what it actually was.
+ */
+function scoreOf(row) {
+  return CONFIG.scoredWitnesses.reduce((sum, w) => sum + Number((row.dirs || {})[w] || 0), 0);
+}
+
+const maxScore = () => CONFIG.scoredWitnesses.length;
+
 function median(values) {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -201,7 +229,7 @@ function journalStatus(file = CONFIG.journalFile) {
   const coinCounts = {};
   for (const row of rows) coinCounts[row.coin] = (coinCounts[row.coin] || 0) + 1;
   const witnessCalls = {};
-  for (const witness of ['funding', 'oi', 'liq', 'whales']) {
+  for (const witness of [...CONFIG.scoredWitnesses, ...CONFIG.researchWitnesses]) {
     witnessCalls[witness] = rows.filter((r) => Number(r.dirs[witness] || 0) !== 0).length;
   }
   const observedCadenceMin = observedJournalCadenceMin(rows) || CONFIG.scanEveryMin;
@@ -222,16 +250,34 @@ function journalStatus(file = CONFIG.journalFile) {
   console.log(`Directional scalper wallets configured here: ${CONFIG.trackedWallets.length} (${walletSamples} rows with active positions)`);
   console.log(`High-turnover/LP wallets configured here: ${CONFIG.liquidityProviderWallets.length} (${liquiditySamples} rows with active inventory)`);
   console.log(`Coins: ${Object.entries(coinCounts).map(([coin, n]) => `${coin}=${n}`).join(', ')}`);
+  console.log(`Scored witnesses: ${CONFIG.scoredWitnesses.join(', ')} (max |score| ${maxScore()}); unscored research: ${CONFIG.researchWitnesses.join(', ')}`);
   console.log(`Non-zero witness calls: ${Object.entries(witnessCalls).map(([w, n]) => `${w}=${n}`).join(', ')}`);
-  console.log(`Threshold events (|score| >= ${CONFIG.alertScore}): ${rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore).length}`);
+  console.log(`Threshold events (|score| >= ${CONFIG.alertScore}): ${rows.filter((r) => Math.abs(scoreOf(r)) >= CONFIG.alertScore).length}`);
 
-  const silentWitnesses = Object.entries(witnessCalls).filter(([, count]) => count === 0).map(([name]) => name);
-  if (witnessCalls.liq === 0 && witnessCalls.whales === 0) {
-    console.log('READINESS: funding/OI were recorded, but liquidation and whale hypotheses were NOT tested. Configure tracked wallets and collect a new window.');
+  // A tracked cohort that never changes size cannot produce flow research no
+  // matter how long collection runs. Surface it here rather than after a week.
+  const v2 = rows.filter((r) => Number(r.schemaVersion || 1) >= 2);
+  const changed = (key) => v2.filter((r) => Math.abs(Number((r.meta || {})[key]) || 0) > 0).length;
+  if (v2.length) {
+    const wallet5 = changed('walletSizeFlow5mUsd');
+    const lp5 = changed('lpSizeFlow5mUsd');
+    console.log(
+      `Cohort activity (5m size changes): directional ${wallet5}/${v2.length} scans (${(wallet5 / v2.length * 100).toFixed(2)}%), `
+      + `high-turnover ${lp5}/${v2.length} (${(lp5 / v2.length * 100).toFixed(2)}%)`,
+    );
+    if (wallet5 / v2.length < 0.02) {
+      console.log('  WARNING: the directional cohort changes size in under 2% of scans. These wallets are too'
+        + ' inactive on these coins to produce a flow sample — re-screen with `screen-wallets` before collecting further.');
+    }
+  }
+
+  const silentWitnesses = CONFIG.scoredWitnesses.filter((w) => witnessCalls[w] === 0);
+  if (witnessCalls.whales === 0 && !rows.some((r) => r.walletDirs && Object.keys(r.walletDirs).length)) {
+    console.log('READINESS: no tracked-wallet data in this window. Configure wallets and collect a new one.');
   } else if (sizeFlowRows === 0) {
     console.log('READINESS: held-position data exists, but real wallet size changes were not recorded in this legacy window.');
   } else if (silentWitnesses.length) {
-    console.log(`READINESS: pipeline healthy, but ${silentWitnesses.join('/')} produced no calls. Keep size-flow research unscored until event counts mature.`);
+    console.log(`READINESS: pipeline healthy, but scored witness(es) ${silentWitnesses.join('/')} produced no calls — the score cannot reach its threshold. Diagnose before collecting further.`);
   } else if (durationDays < 14) {
     console.log('READINESS: the full witnesses are present, but this is an early diagnostic window; keep collecting for several weeks.');
   } else {
@@ -408,15 +454,54 @@ function fundingWitness(currentRate, history) {
   return { dir: 0, z, note: `funding normal (z=${Math.abs(z) > 100 ? 'flat-window' : z.toFixed(1)})` };
 }
 
-function oiWitness(oiNow, oiPast, fundingDir) {
+/**
+ * OI testifies on its own from the price/OI regime, rather than only confirming
+ * funding. The previous version returned dir=0 unless the funding witness had
+ * already fired, so it could never speak independently: over 63,900 live scans
+ * 4,451 rows showed a qualifying OI expansion but OI recorded zero calls,
+ * because funding fired 72 times and never once coincided with them.
+ *
+ * The reading is the standard one: OI expanding while price moves means new
+ * money is entering in the direction of the move (crowd building). OI expanding
+ * is required — a move on shrinking OI is position closing, not fresh conviction,
+ * and gets no vote.
+ *
+ * Note this can legitimately OPPOSE the funding witness, which fades a crowded
+ * side. That is two different hypotheses (momentum vs mean reversion) disagreeing,
+ * not a bug — the score cancelling is the correct outcome, and the journal
+ * measures which one is right.
+ */
+function oiWitness(oiNow, oiPast, markPxNow, markPxPast) {
   if (!oiPast) return { dir: 0, note: `OI: no ${CONFIG.oiLookbackMin}m-old snapshot yet` };
   const chg = ((oiNow - oiPast) / oiPast) * 100;
-  // Rising OI only *confirms* the funding witness (the crowd is growing). It has no direction alone.
-  if (chg >= CONFIG.oiChangePct && fundingDir !== 0)
-    return { dir: fundingDir, chg, note: `OI up ${fmtPct(chg)} in ${CONFIG.oiLookbackMin}m → crowd growing, confirms funding` };
-  return { dir: 0, chg, note: `OI ${fmtPct(chg)} in ${CONFIG.oiLookbackMin}m` };
+  const priceChg = Number.isFinite(markPxPast) && markPxPast
+    ? ((markPxNow - markPxPast) / markPxPast) * 100
+    : null;
+  const expanding = chg >= CONFIG.oiChangePct;
+  const moved = Number.isFinite(priceChg) && Math.abs(priceChg) >= CONFIG.minPriceChangePct;
+  if (expanding && moved) {
+    const dir = Math.sign(priceChg);
+    return {
+      dir, chg, priceChg,
+      note: `OI up ${fmtPct(chg)} with price ${fmtPct(priceChg)} in ${CONFIG.oiLookbackMin}m`
+        + ` → new ${dir > 0 ? 'longs' : 'shorts'} building, argues ${dir > 0 ? 'UP' : 'DOWN'}`,
+    };
+  }
+  const why = !expanding
+    ? (chg <= -CONFIG.oiChangePct ? 'positions closing, not fresh conviction' : 'flat crowd')
+    : 'OI expanding but price has not moved enough to give it a direction';
+  return { dir: 0, chg, priceChg, note: `OI ${fmtPct(chg)} in ${CONFIG.oiLookbackMin}m → ${why}` };
 }
 
+/**
+ * UNSCORED (see CONFIG.researchWitnesses). This builds a liquidation map from
+ * the tracked cohort's own liqPx values, so it describes 8 accounts, not the
+ * market. Hyperliquid exposes no market-wide liquidation heatmap, and these
+ * accounts run low enough leverage that their liquidation prices sit far
+ * outside the scalp band — 63,900 live scans produced zero pockets at any size.
+ * Kept computed and journaled so the cohort can be re-checked after re-screening,
+ * but it must not sit in the score as a permanent zero.
+ */
 function liqMapWitness(positions, markPx) {
   const band = CONFIG.liqClusterBandPct / 100;
   const bins = {}; // binKey -> total USD
@@ -556,7 +641,12 @@ async function scanOnce(state, { silent = false } = {}) {
 
     const snaps = state.oiSnapshots[coin] || [];
     const oiPast = snaps.filter((s) => s.time <= nowMs() - CONFIG.oiLookbackMin * 60e3).pop();
-    const wOi = oiWitness(m.oiUsd, oiPast ? oiPast.oiUsd : null, wFund.dir);
+    const wOi = oiWitness(
+      m.oiUsd,
+      oiPast ? oiPast.oiUsd : null,
+      m.markPx,
+      oiPast ? oiPast.markPx : null,
+    );
 
     const positions = byCoin[coin] || [];
     const lpPositions = lpByCoin[coin] || [];
@@ -584,32 +674,31 @@ async function scanOnce(state, { silent = false } = {}) {
     );
     state.directionalWalletSnapshots[coin] = walletSnaps;
 
-    const oiResearchPast = snaps.filter((s) => s.time <= scanTime - CONFIG.oiResearchLookbackMin * 60e3).pop();
-    const oiResearchChangePct = oiResearchPast
-      ? ((m.oiUsd - oiResearchPast.oiUsd) / oiResearchPast.oiUsd) * 100
-      : null;
-    const priceResearchChangePct = oiResearchPast && Number.isFinite(oiResearchPast.markPx)
-      ? ((m.markPx - oiResearchPast.markPx) / oiResearchPast.markPx) * 100
-      : null;
+    // The unscored price/OI research series predates the scored OI witness and
+    // uses |OI change| rather than expansion-only. It is kept computing the
+    // original way so its numbers stay comparable across the schema change;
+    // the scored witness above is the stricter expansion-only version.
+    const oiResearchChangePct = Number.isFinite(wOi.chg) ? wOi.chg : null;
+    const priceResearchChangePct = Number.isFinite(wOi.priceChg) ? wOi.priceChg : null;
     const oiPriceDir = Number.isFinite(oiResearchChangePct)
       && Number.isFinite(priceResearchChangePct)
-      && Math.abs(oiResearchChangePct) >= CONFIG.minOiResearchChangePct
-      && Math.abs(priceResearchChangePct) >= CONFIG.minPriceResearchChangePct
+      && Math.abs(oiResearchChangePct) >= CONFIG.oiChangePct
+      && Math.abs(priceResearchChangePct) >= CONFIG.minPriceChangePct
       ? Math.sign(priceResearchChangePct)
       : 0;
 
-    // Keep enough minute snapshots for several one-hour comparisons.
+    // Keep enough minute snapshots for several lookback comparisons.
     snaps.push({ time: scanTime, oiUsd: m.oiUsd, markPx: m.markPx });
     state.oiSnapshots[coin] = snaps.filter((s) => s.time > scanTime - Math.max(6 * 3600e3, CONFIG.oiLookbackMin * 4 * 60e3));
 
     const witnesses = { funding: wFund, oi: wOi, liq: wLiq, whales: wWhale };
-    const score = wFund.dir + wOi.dir + wLiq.dir + wWhale.dir;
+    const score = scoreOf({ dirs: mapValues(witnesses, (w) => w.dir) });
     results.push({ coin, markPx: m.markPx, score, witnesses });
 
     // journal every scan (not just alerts) — this is the dataset that makes
     // the liq-map and whale witnesses backtestable via `evaluate`
     fs.appendFileSync(CONFIG.journalFile, JSON.stringify({
-      schemaVersion: 2,
+      schemaVersion: 3,
       time: scanTime, coin, markPx: m.markPx, score,
       dirs: { funding: wFund.dir, oi: wOi.dir, liq: wLiq.dir, whales: wWhale.dir },
       meta: {
@@ -691,7 +780,8 @@ async function runLive() {
   const state = loadState();
   let lastResults = [];
   console.log(`edge-bot live. Coins: ${CONFIG.coins.join(', ')}. Scan every ${CONFIG.scanEveryMin}m.`);
-  await tgSend(`edge-bot online. Watching ${CONFIG.coins.join(', ')}. Alert threshold: ${CONFIG.alertScore}/4 witnesses.`);
+  await tgSend(`edge-bot online. Watching ${CONFIG.coins.join(', ')}. Alert threshold: ${CONFIG.alertScore}/${maxScore()} witnesses.`
+    + (CONFIG.researchMode ? '\nRESEARCH MODE: journaling only, no trade alerts will be sent.' : ''));
 
   let nextScan = 0;
   while (true) {
@@ -705,6 +795,10 @@ async function runLive() {
           if (nowMs() - last < CONFIG.alertCooldownMin * 60e3) continue;
           state.lastAlerts[key] = nowMs();
           saveState(state);
+          if (CONFIG.researchMode) {
+            console.log(`[research-mode, not sent] confluence ${r.coin} score ${r.score}`);
+            continue;
+          }
           await tgSend(`⚡ CONFLUENCE ALERT\n\n${formatReport(r)}\n\nNot financial advice. Check the chart.`);
         }
         console.log(`[${new Date().toISOString()}] scanned ${lastResults.length} coins`);
@@ -992,8 +1086,8 @@ async function evaluate(file = CONFIG.journalFile) {
   console.log(`Usable price outcomes: ${rows.length} raw; ${independent.length} non-overlapping per-coin observations across ${independentBuckets} time buckets.`);
   console.log(`\nForward ${CONFIG.backtest.holdHours}h returns by confluence score (non-overlapping sample):`);
   console.log('score   n     avg fwd ret   agree%  (agree = price moved in the score\'s direction)');
-  for (let s = -4; s <= 4; s++) {
-    const g = independent.filter((r) => r.score === s);
+  for (let s = -maxScore(); s <= maxScore(); s++) {
+    const g = independent.filter((r) => scoreOf(r) === s);
     if (!g.length) continue;
     const avg = mean(g.map((r) => r.fwdRet));
     const agree = s === 0 ? null : g.filter((r) => Math.sign(r.fwdRet) === Math.sign(s)).length / g.length;
@@ -1001,11 +1095,11 @@ async function evaluate(file = CONFIG.journalFile) {
   }
 
   const actionable = selectNonOverlapping(
-    rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore),
+    rows.filter((r) => Math.abs(scoreOf(r)) >= CONFIG.alertScore),
     holdMs,
   );
   if (actionable.length) {
-    const net = actionable.map((r) => Math.sign(r.score) * r.fwdRet - 2 * CONFIG.backtest.feePerSide);
+    const net = actionable.map((r) => Math.sign(scoreOf(r)) * r.fwdRet - 2 * CONFIG.backtest.feePerSide);
     const avgNet = mean(net);
     const se = net.length > 1 ? std(net) / Math.sqrt(net.length) : 0;
     const tStat = se > 0 ? avgNet / se : 0;
@@ -1017,7 +1111,7 @@ async function evaluate(file = CONFIG.journalFile) {
   }
 
   console.log('\nPer-witness results use non-overlapping non-zero calls:');
-  for (const w of ['funding', 'oi', 'liq', 'whales']) {
+  for (const w of [...CONFIG.scoredWitnesses, ...CONFIG.researchWitnesses]) {
     const g = selectNonOverlapping(rows.filter((r) => Number(r.dirs[w] || 0) !== 0), holdMs);
     if (!g.length) { console.log(`  ${w}: no non-zero calls yet`); continue; }
     const agree = g.filter((r) => Math.sign(r.fwdRet) === r.dirs[w]).length / g.length;
@@ -1096,8 +1190,8 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
     }
 
     console.log('score   n     avg fwd ret   agree%');
-    for (let score = -4; score <= 4; score++) {
-      const group = independent.filter((r) => r.score === score);
+    for (let score = -maxScore(); score <= maxScore(); score++) {
+      const group = independent.filter((r) => scoreOf(r) === score);
       if (!group.length) continue;
       const avg = mean(group.map((r) => r.fwdRet));
       const agree = score === 0
@@ -1107,14 +1201,14 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
     }
 
     const actionable = selectNonOverlapping(
-      rows.filter((r) => Math.abs(r.score) >= CONFIG.alertScore),
+      rows.filter((r) => Math.abs(scoreOf(r)) >= CONFIG.alertScore),
       horizonMs,
     );
-    console.log(`\nConfluence (|score| >= ${CONFIG.alertScore}):`);
-    printScalpSample('combined', actionable, (r) => Math.sign(r.score));
+    console.log(`\nConfluence (|score| >= ${CONFIG.alertScore} of max ${maxScore()}):`);
+    printScalpSample('combined', actionable, (r) => Math.sign(scoreOf(r)));
 
-    console.log('Witnesses:');
-    for (const witness of ['funding', 'oi', 'liq', 'whales']) {
+    console.log(`Witnesses (scored: ${CONFIG.scoredWitnesses.join(', ')}; unscored: ${CONFIG.researchWitnesses.join(', ')}):`);
+    for (const witness of [...CONFIG.scoredWitnesses, ...CONFIG.researchWitnesses]) {
       const group = selectNonOverlapping(
         rows.filter((r) => Number(r.dirs[witness] || 0) !== 0),
         horizonMs,
@@ -1171,7 +1265,7 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
       rows.filter((r) => Number(r.schemaVersion || 1) >= 2 && Number((r.meta || {}).oiPriceDir || 0) !== 0),
       horizonMs,
     );
-    printScalpSample(`${CONFIG.oiResearchLookbackMin}m price+OI expansion`, oiPrice, (r) => Number(r.meta.oiPriceDir));
+    printScalpSample(`${CONFIG.oiLookbackMin}m price+OI change (abs, includes shrinking OI)`, oiPrice, (r) => Number(r.meta.oiPriceDir));
 
     console.log('Observed liquidation-pocket hypothesis (unscored):');
     const observedLiq = selectNonOverlapping(
@@ -1183,6 +1277,99 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
     printScalpSample(`pockets >= ${fmtUsd(CONFIG.minLiqResearchUsd)}`, observedLiq, (r) => Math.sign(Number(r.meta.liqObservedDistancePct)));
   }
   console.log('\nInterpretation: compare gross and fee-adjusted returns. Do not promote LP flow into the alert score until one orientation repeats across many independent time buckets and market regimes.');
+}
+
+/* ============================== COHORT SCREENING ============================== */
+
+/**
+ * Walk a wallet's fills into per-coin signed size, then count how many
+ * non-overlapping windows contain a size change large enough for the collector
+ * to record. This measures the thing that actually matters — whether the
+ * collector can SEE this wallet trade — instead of leaderboard PnL.
+ *
+ * The previous cohort was screened for LOW fill frequency so positions would
+ * stay observable at a 1-minute cadence. That selected for wallets which barely
+ * trade: the live journal caught a size change in 0.27% of scans. This screen
+ * reports both ends so the trade-off is explicit rather than accidental.
+ */
+function screenFills(fills, coins, windowMin, minFlowUsd) {
+  const wanted = new Set(coins);
+  const relevant = fills.filter((f) => wanted.has(f.coin));
+  if (!relevant.length) return { fills: 0, windows: 0, events: 0, coins: [] };
+
+  const sorted = [...relevant].sort((a, b) => a.time - b.time);
+  const windowMs = windowMin * 60e3;
+  const first = sorted[0].time;
+  const last = sorted[sorted.length - 1].time;
+  // Bucket signed notional by (coin, window). A window is an "event" when the
+  // wallet's net size moved enough in it to clear the collector's threshold.
+  const buckets = new Map();
+  for (const f of sorted) {
+    const signed = (f.side === 'B' ? 1 : -1) * Number(f.sz) * Number(f.px);
+    const key = `${f.coin}:${Math.floor(f.time / windowMs)}`;
+    buckets.set(key, (buckets.get(key) || 0) + signed);
+  }
+  const events = [...buckets.values()].filter((usd) => Math.abs(usd) >= minFlowUsd).length;
+  const spanWindows = Math.max(1, Math.round((last - first) / windowMs)) * wanted.size;
+  return {
+    fills: relevant.length,
+    windows: spanWindows,
+    events,
+    spanDays: (last - first) / 86400e3,
+    coins: [...new Set(relevant.map((f) => f.coin))],
+  };
+}
+
+async function screenWallets(arg) {
+  const candidates = (arg
+    ? arg.split(',').map((w) => w.trim().toLowerCase()).filter((w) => /^0x[a-f0-9]{40}$/.test(w))
+    : [...CONFIG.trackedWallets, ...CONFIG.liquidityProviderWallets]);
+  if (!candidates.length) {
+    console.log('No wallets to screen. Pass addresses, or configure HYPERLIQUID_TRACKED_WALLETS / HYPERLIQUID_LP_WALLETS.');
+    return;
+  }
+  const windowMin = Math.min(...CONFIG.walletFlowLookbackMin);
+  console.log(`Screening ${candidates.length} wallet(s) against ${CONFIG.coins.join(', ')}`);
+  console.log(`Observability test: does net size move >= ${fmtUsd(CONFIG.minWalletFlowUsd)} within a ${windowMin}m window?\n`);
+  console.log('wallet              fills  span   events  ev/day  coins traded');
+
+  const scored = [];
+  for (const wallet of candidates) {
+    let fills;
+    try {
+      fills = await hl({ type: 'userFills', user: wallet });
+    } catch (e) {
+      console.log(`${wallet.slice(0, 10)}…${wallet.slice(-4)}  fetch failed: ${e.message}`);
+      await sleep(250);
+      continue;
+    }
+    const r = screenFills(Array.isArray(fills) ? fills : [], CONFIG.coins, windowMin, CONFIG.minWalletFlowUsd);
+    const perDay = r.spanDays > 0 ? r.events / r.spanDays : 0;
+    // 2000 is the API's response cap: a full page means history is truncated and
+    // the real fill rate is at least this high, so the span is a lower bound.
+    const capped = Array.isArray(fills) && fills.length >= 2000;
+    scored.push({ wallet, ...r, perDay, capped });
+    console.log(
+      `${wallet.slice(0, 10)}…${wallet.slice(-4)}  ${String(r.fills).padEnd(6)} `
+      + `${(r.spanDays ? r.spanDays.toFixed(1) + 'd' : '—').padEnd(6)} ${String(r.events).padEnd(7)} `
+      + `${perDay.toFixed(1).padEnd(7)} ${r.coins.join(',') || '(none on our coins)'}${capped ? '  [fill history truncated]' : ''}`,
+    );
+    await sleep(250);
+  }
+
+  console.log('\nVerdict — a wallet is useful to us only if it trades OUR coins often enough to sample:');
+  const useful = scored.filter((s) => s.perDay >= 1 && s.coins.length);
+  const idle = scored.filter((s) => s.coins.length && s.perDay < 1);
+  const offCoin = scored.filter((s) => !s.coins.length);
+  for (const s of useful) console.log(`  KEEP    ${s.wallet}  ${s.perDay.toFixed(1)} observable events/day`);
+  for (const s of idle) console.log(`  DROP    ${s.wallet}  only ${s.perDay.toFixed(2)} events/day on our coins — too quiet to measure`);
+  for (const s of offCoin) console.log(`  DROP    ${s.wallet}  trades none of our coins`);
+  console.log(`\n${useful.length} of ${scored.length} candidates produce a usable flow sample.`);
+  if (useful.length) {
+    console.log('\nHYPERLIQUID_TRACKED_WALLETS=' + useful.map((s) => s.wallet).join(','));
+  }
+  console.log('\nNote: this measures observability, not profitability. Screen candidates for repeatable'
+    + ' performance first, then run this to check we can actually see them trade.');
 }
 
 /* ============================== SELFTEST (audit mode) ============================== */
@@ -1265,6 +1452,33 @@ function selftest() {
   check('extreme positive funding argues DOWN', fundingWitness(0.01, hist).dir === -1);
   check('extreme negative funding argues UP', fundingWitness(-0.01, hist).dir === 1);
   check('normal funding is neutral', fundingWitness(0.00001, hist).dir === 0);
+  // 5b. OI must testify without funding. The old version returned dir=0 unless
+  //     funding had already fired, which made it permanently silent in production.
+  console.log('[5b] OI witness is independent of funding');
+  const oiUp = oiWitness(110, 100, 101, 100);   // OI +10%, price +1%
+  check('OI expanding into a rising price argues UP with no funding call', oiUp.dir === 1);
+  const oiDown = oiWitness(110, 100, 99, 100);  // OI +10%, price -1%
+  check('OI expanding into a falling price argues DOWN', oiDown.dir === -1);
+  check('OI shrinking is position closing, not conviction → neutral', oiWitness(90, 100, 101, 100).dir === 0);
+  check('OI expanding on a flat price has no direction', oiWitness(110, 100, 100.01, 100).dir === 0);
+  check('no prior snapshot yields no call instead of a fake one', oiWitness(110, null, 101, 100).dir === 0);
+  check('OI change below threshold stays neutral', oiWitness(100.1, 100, 101, 100).dir === 0);
+
+  // 5c. Scoring must come from the scored witnesses only, so an always-silent
+  //     research witness cannot raise the bar for the rest.
+  console.log('[5c] score excludes unscored research witnesses');
+  check('liq is not scored', !CONFIG.scoredWitnesses.includes('liq'));
+  check('a liq call alone does not move the score',
+    scoreOf({ dirs: { funding: 0, oi: 0, liq: 1, whales: 0 } }) === 0);
+  check('funding + oi + whales agreeing reaches the max score',
+    scoreOf({ dirs: { funding: 1, oi: 1, liq: -1, whales: 1 } }) === maxScore());
+  check('alert threshold is reachable by the scored witnesses', CONFIG.alertScore <= maxScore());
+  check('unproven witnesses cannot send trade alerts', CONFIG.researchMode === true);
+  check('opposing witnesses cancel rather than accumulate',
+    scoreOf({ dirs: { funding: -1, oi: 1, whales: 1 } }) === 1);
+  check('a row missing a witness counts it as silent, not as a crash',
+    scoreOf({ dirs: { whales: -1 } }) === -1 && scoreOf({}) === 0);
+
   const liq = liqMapWitness([{ coin: 'BTC', size: 5, notionalUsd: 500_000, liqPx: 98.5 }], 100);
   check('big liq cluster below price → magnet argues DOWN', liq.dir === -1);
   const weakLiq = liqMapWitness([{ coin: 'BTC', size: 1, notionalUsd: 100_000, liqPx: 99 }], 100);
@@ -1325,6 +1539,29 @@ function selftest() {
   check('incomplete wallet fetch cannot create a fake zero-position flow',
     unavailable.available === false && unavailable.flowUsd[5] === null && lpSnaps.length === snapshotsBeforeFailure);
 
+  // 9. Cohort screening must count windows the collector could actually observe,
+  //    not raw fill counts — that is the check the old leaderboard screen lacked.
+  console.log('[9] cohort observability screen');
+  // Align to a window boundary so the fixture tests the netting rule rather
+  // than which side of an arbitrary boundary each fill happens to land on.
+  const t9 = 1_700_000_000_000 - (1_700_000_000_000 % (5 * 60e3));
+  const screened = screenFills([
+    // two fills inside one 5m window that net out to a big change on BTC
+    { coin: 'BTC', time: t9, sz: '1', px: '50000', side: 'B' },
+    { coin: 'BTC', time: t9 + 60e3, sz: '1', px: '50000', side: 'B' },
+    // an offsetting pair in the next window: the collector would see ~no change
+    { coin: 'BTC', time: t9 + 6 * 60e3, sz: '1', px: '50000', side: 'B' },
+    { coin: 'BTC', time: t9 + 7 * 60e3, sz: '1', px: '50000', side: 'A' },
+    // a coin we do not track must be ignored entirely
+    { coin: 'PEPE', time: t9 + 12 * 60e3, sz: '9999', px: '50000', side: 'B' },
+  ], ['BTC', 'ETH'], 5, 25_000);
+  check('offsetting fills inside one window are not counted as observable flow', screened.events === 1);
+  check('fills on untracked coins are excluded', !screened.coins.includes('PEPE') && screened.fills === 4);
+  const quiet = screenFills([{ coin: 'BTC', time: t9, sz: '0.01', px: '50000', side: 'B' }], ['BTC'], 5, 25_000);
+  check('a change below the collector threshold is not an observable event', quiet.events === 0);
+  check('a wallet trading none of our coins screens as empty',
+    screenFills([{ coin: 'PEPE', time: t9, sz: '1', px: '1', side: 'B' }], ['BTC'], 5, 25_000).events === 0);
+
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED ✔' : failed + ' CHECK(S) FAILED ✘'}`);
   process.exit(failed === 0 ? 0 : 1);
 }
@@ -1342,10 +1579,11 @@ const [, , cmd, arg1, arg2] = process.argv;
     evaluateScalps(arg1 || CONFIG.journalFile, horizons);
   }
   else if (cmd === 'journal-status') journalStatus(arg1 || CONFIG.journalFile);
+  else if (cmd === 'screen-wallets') await screenWallets(arg1);
   else if (cmd === 'scan') {
     const results = await scanOnce(loadState(), { silent: false });
     console.log(results.map(formatReport).join('\n\n'));
   }
   else if (cmd === 'run') await runLive();
-  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | evaluate [FILE] | evaluate-scalps [FILE] [MINUTES] | selftest]');
+  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | screen-wallets [ADDR,ADDR] | evaluate [FILE] | evaluate-scalps [FILE] [MINUTES] | selftest]');
 })().catch((e) => { console.error('fatal:', e.message); process.exit(1); });
