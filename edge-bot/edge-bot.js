@@ -1329,6 +1329,13 @@ function screenFills(fills, coins, windowMin, minFlowUsd, windowStartMs, windowE
 }
 
 async function screenWallets(arg) {
+  // Keep each candidate's cohort attached. The directional and high-turnover
+  // cohorts are deliberately separate — a suggestion that merged them would
+  // quietly put market-maker inventory into the directional vote.
+  const cohortOf = new Map([
+    ...CONFIG.trackedWallets.map((w) => [w, 'directional']),
+    ...CONFIG.liquidityProviderWallets.map((w) => [w, 'high-turnover']),
+  ]);
   const candidates = (arg
     ? arg.split(',').map((w) => w.trim().toLowerCase()).filter((w) => /^0x[a-f0-9]{40}$/.test(w))
     : [...CONFIG.trackedWallets, ...CONFIG.liquidityProviderWallets]);
@@ -1359,7 +1366,7 @@ async function screenWallets(arg) {
     const r = screenFills(
       Array.isArray(fills) ? fills : [], CONFIG.coins, windowMin, CONFIG.minWalletFlowUsd, windowStart, windowEnd,
     );
-    scored.push({ wallet, ...r });
+    scored.push({ wallet, cohort: cohortOf.get(wallet) || 'unclassified', ...r });
     console.log(
       `${wallet.slice(0, 10)}…${wallet.slice(-4)}  ${`${r.fills}/${r.totalFills}`.padEnd(13)} `
       + `${(r.coveredDays.toFixed(1) + 'd').padEnd(8)} ${String(r.events).padEnd(7)} `
@@ -1373,12 +1380,20 @@ async function screenWallets(arg) {
   const useful = scored.filter((s) => s.perDay >= 1 && s.coins.length);
   const idle = scored.filter((s) => s.coins.length && s.perDay < 1);
   const offCoin = scored.filter((s) => !s.coins.length);
-  for (const s of useful) console.log(`  KEEP    ${s.wallet}  ${s.perDay.toFixed(1)} observable events/day`);
-  for (const s of idle) console.log(`  DROP    ${s.wallet}  only ${s.perDay.toFixed(2)} events/day on our coins — too quiet to measure`);
-  for (const s of offCoin) console.log(`  DROP    ${s.wallet}  trades none of our coins`);
+  for (const s of useful) console.log(`  KEEP    [${s.cohort}] ${s.wallet}  ${s.perDay.toFixed(1)} observable events/day`);
+  for (const s of idle) console.log(`  DROP    [${s.cohort}] ${s.wallet}  only ${s.perDay.toFixed(2)} events/day on our coins — too quiet to measure`);
+  for (const s of offCoin) console.log(`  DROP    [${s.cohort}] ${s.wallet}  trades none of our coins`);
   console.log(`\n${useful.length} of ${scored.length} candidates produce a usable flow sample.`);
-  if (useful.length) {
-    console.log('\nHYPERLIQUID_TRACKED_WALLETS=' + useful.map((s) => s.wallet).join(','));
+
+  const byCohort = (name) => useful.filter((s) => s.cohort === name).map((s) => s.wallet);
+  const directional = byCohort('directional');
+  const highTurnover = byCohort('high-turnover');
+  const unclassified = byCohort('unclassified');
+  if (directional.length) console.log('\nHYPERLIQUID_TRACKED_WALLETS=' + directional.join(','));
+  if (highTurnover.length) console.log('HYPERLIQUID_LP_WALLETS=' + highTurnover.join(','));
+  if (unclassified.length) {
+    console.log('\nNot yet assigned to a cohort — decide directional vs high-turnover before adding:');
+    for (const w of unclassified) console.log(`  ${w}`);
   }
   console.log('\nNote: this measures observability, not profitability. Screen candidates for repeatable'
     + ' performance first, then run this to check we can actually see them trade.');
