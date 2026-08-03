@@ -1292,30 +1292,38 @@ function evaluateScalps(file = CONFIG.journalFile, horizonsMin = CONFIG.scalpEva
  * trade: the live journal caught a size change in 0.27% of scans. This screen
  * reports both ends so the trade-off is explicit rather than accidental.
  */
-function screenFills(fills, coins, windowMin, minFlowUsd) {
+function screenFills(fills, coins, windowMin, minFlowUsd, windowStartMs, windowEndMs) {
   const wanted = new Set(coins);
-  const relevant = fills.filter((f) => wanted.has(f.coin));
-  if (!relevant.length) return { fills: 0, windows: 0, events: 0, coins: [] };
+  const all = [...fills].sort((a, b) => a.time - b.time);
+  const relevant = all.filter((f) => wanted.has(f.coin));
 
-  const sorted = [...relevant].sort((a, b) => a.time - b.time);
+  // The rate must be measured over the window we ASKED for, not the span between
+  // matching fills. Dividing by the latter turns a wallet that traded twice in
+  // one minute into thousands of events per day.
+  //
+  // The API caps a response at 2000 fills. When that happens we only received
+  // the start of the window, so coverage ends at the last fill we actually got.
+  const truncated = all.length >= 2000;
+  const coveredEnd = truncated && all.length ? all[all.length - 1].time : windowEndMs;
+  const coveredDays = Math.max((coveredEnd - windowStartMs) / 86400e3, 0);
+
   const windowMs = windowMin * 60e3;
-  const first = sorted[0].time;
-  const last = sorted[sorted.length - 1].time;
   // Bucket signed notional by (coin, window). A window is an "event" when the
   // wallet's net size moved enough in it to clear the collector's threshold.
   const buckets = new Map();
-  for (const f of sorted) {
+  for (const f of relevant) {
     const signed = (f.side === 'B' ? 1 : -1) * Number(f.sz) * Number(f.px);
     const key = `${f.coin}:${Math.floor(f.time / windowMs)}`;
     buckets.set(key, (buckets.get(key) || 0) + signed);
   }
   const events = [...buckets.values()].filter((usd) => Math.abs(usd) >= minFlowUsd).length;
-  const spanWindows = Math.max(1, Math.round((last - first) / windowMs)) * wanted.size;
   return {
     fills: relevant.length,
-    windows: spanWindows,
+    totalFills: all.length,
     events,
-    spanDays: (last - first) / 86400e3,
+    coveredDays,
+    truncated,
+    perDay: coveredDays > 0 ? events / coveredDays : 0,
     coins: [...new Set(relevant.map((f) => f.coin))],
   };
 }
@@ -1329,30 +1337,34 @@ async function screenWallets(arg) {
     return;
   }
   const windowMin = Math.min(...CONFIG.walletFlowLookbackMin);
-  console.log(`Screening ${candidates.length} wallet(s) against ${CONFIG.coins.join(', ')}`);
+  const lookbackDays = 14;
+  const windowStart = nowMs() - lookbackDays * 86400e3;
+  const windowEnd = nowMs();
+  console.log(`Screening ${candidates.length} wallet(s) against ${CONFIG.coins.join(', ')} over the last ${lookbackDays} days`);
   console.log(`Observability test: does net size move >= ${fmtUsd(CONFIG.minWalletFlowUsd)} within a ${windowMin}m window?\n`);
-  console.log('wallet              fills  span   events  ev/day  coins traded');
+  console.log('wallet              our/all fills  covered  events  ev/day  coins traded');
 
   const scored = [];
   for (const wallet of candidates) {
     let fills;
     try {
-      fills = await hl({ type: 'userFills', user: wallet });
+      // Ask for a known window so the rate has a real denominator. `userFills`
+      // returns only "recent" fills with no stated period, which is unusable here.
+      fills = await hl({ type: 'userFillsByTime', user: wallet, startTime: windowStart, endTime: windowEnd });
     } catch (e) {
       console.log(`${wallet.slice(0, 10)}…${wallet.slice(-4)}  fetch failed: ${e.message}`);
       await sleep(250);
       continue;
     }
-    const r = screenFills(Array.isArray(fills) ? fills : [], CONFIG.coins, windowMin, CONFIG.minWalletFlowUsd);
-    const perDay = r.spanDays > 0 ? r.events / r.spanDays : 0;
-    // 2000 is the API's response cap: a full page means history is truncated and
-    // the real fill rate is at least this high, so the span is a lower bound.
-    const capped = Array.isArray(fills) && fills.length >= 2000;
-    scored.push({ wallet, ...r, perDay, capped });
+    const r = screenFills(
+      Array.isArray(fills) ? fills : [], CONFIG.coins, windowMin, CONFIG.minWalletFlowUsd, windowStart, windowEnd,
+    );
+    scored.push({ wallet, ...r });
     console.log(
-      `${wallet.slice(0, 10)}…${wallet.slice(-4)}  ${String(r.fills).padEnd(6)} `
-      + `${(r.spanDays ? r.spanDays.toFixed(1) + 'd' : '—').padEnd(6)} ${String(r.events).padEnd(7)} `
-      + `${perDay.toFixed(1).padEnd(7)} ${r.coins.join(',') || '(none on our coins)'}${capped ? '  [fill history truncated]' : ''}`,
+      `${wallet.slice(0, 10)}…${wallet.slice(-4)}  ${`${r.fills}/${r.totalFills}`.padEnd(13)} `
+      + `${(r.coveredDays.toFixed(1) + 'd').padEnd(8)} ${String(r.events).padEnd(7)} `
+      + `${r.perDay.toFixed(1).padEnd(7)} ${r.coins.join(',') || '(none on our coins)'}`
+      + `${r.truncated ? '  [hit 2000-fill cap: rate is a lower bound]' : ''}`,
     );
     await sleep(250);
   }
@@ -1545,6 +1557,7 @@ function selftest() {
   // Align to a window boundary so the fixture tests the netting rule rather
   // than which side of an arbitrary boundary each fill happens to land on.
   const t9 = 1_700_000_000_000 - (1_700_000_000_000 % (5 * 60e3));
+  const screenWindow = { start: t9 - 86400e3, end: t9 + 86400e3 };
   const screened = screenFills([
     // two fills inside one 5m window that net out to a big change on BTC
     { coin: 'BTC', time: t9, sz: '1', px: '50000', side: 'B' },
@@ -1554,13 +1567,25 @@ function selftest() {
     { coin: 'BTC', time: t9 + 7 * 60e3, sz: '1', px: '50000', side: 'A' },
     // a coin we do not track must be ignored entirely
     { coin: 'PEPE', time: t9 + 12 * 60e3, sz: '9999', px: '50000', side: 'B' },
-  ], ['BTC', 'ETH'], 5, 25_000);
+  ], ['BTC', 'ETH'], 5, 25_000, screenWindow.start, screenWindow.end);
   check('offsetting fills inside one window are not counted as observable flow', screened.events === 1);
   check('fills on untracked coins are excluded', !screened.coins.includes('PEPE') && screened.fills === 4);
-  const quiet = screenFills([{ coin: 'BTC', time: t9, sz: '0.01', px: '50000', side: 'B' }], ['BTC'], 5, 25_000);
+  check('rate uses the requested window, not the span between matching fills',
+    Math.abs(screened.coveredDays - 2) < 1e-9 && Math.abs(screened.perDay - 0.5) < 1e-9);
+  const quiet = screenFills([{ coin: 'BTC', time: t9, sz: '0.01', px: '50000', side: 'B' }], ['BTC'], 5, 25_000,
+    screenWindow.start, screenWindow.end);
   check('a change below the collector threshold is not an observable event', quiet.events === 0);
   check('a wallet trading none of our coins screens as empty',
-    screenFills([{ coin: 'PEPE', time: t9, sz: '1', px: '1', side: 'B' }], ['BTC'], 5, 25_000).events === 0);
+    screenFills([{ coin: 'PEPE', time: t9, sz: '1', px: '1', side: 'B' }], ['BTC'], 5, 25_000,
+      screenWindow.start, screenWindow.end).events === 0);
+  // A capped response only covers up to its last fill; crediting the full
+  // requested window would understate an HFT account's true rate.
+  const capped = screenFills(
+    Array.from({ length: 2000 }, (_, i) => ({ coin: 'BTC', time: t9 + i, sz: '1', px: '50000', side: 'B' })),
+    ['BTC'], 5, 25_000, t9 - 86400e3, t9 + 10 * 86400e3,
+  );
+  check('a truncated response is flagged and shortens the covered window',
+    capped.truncated && capped.coveredDays > 0.99 && capped.coveredDays < 1.01);
 
   console.log(`\n${failed === 0 ? 'ALL CHECKS PASSED ✔' : failed + ' CHECK(S) FAILED ✘'}`);
   process.exit(failed === 0 ? 0 : 1);
