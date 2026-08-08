@@ -308,11 +308,11 @@ test("results use plain labels and explain the t-statistic", async () => {
     const text = resultsText(tracker);
     for (const label of [
       "Total alerts published",
-      "Entries activated",
-      "Entries never activated",
+      "Awaiting Entry Price",
+      "Entered and still being monitored",
       "Cancelled before entry",
-      "Still being monitored",
-      "Expired without a result",
+      "Expired before entry",
+      "Expired after entry",
       "Completed setups",
       "First Profit Target (1:1)",
       "Final Profit Target (3:1)",

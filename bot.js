@@ -247,13 +247,14 @@ function ownerGuard(msg) {
 }
 
 function sendHtml(chatId, text, extra = {}) {
-  if (!bot) return Promise.resolve();
+  if (!bot) return Promise.resolve(false);
   return bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
     disable_web_page_preview: true,
     ...extra,
-  }).catch((err) => {
+  }).then(() => true).catch((err) => {
     console.error("Telegram send failed:", err.message);
+    return false;
   });
 }
 
@@ -764,6 +765,7 @@ async function scanMarkets(manual = false) {
   const started = Date.now();
   const signals = [];
   const errors = [];
+  let liveDataPairs = 0;
 
   for (const pair of state.pairs) {
     try {
@@ -772,6 +774,11 @@ async function scanMarkets(manual = false) {
         fetchCandles(pair, "5m", 120),
         fetchCandles(pair, "1h", 120),
       ]);
+      if (!c15.length || !c5.length || !c1h.length) {
+        errors.push(`${pair.api}: missing closed candles (15m=${c15.length}, 5m=${c5.length}, 1h=${c1h.length})`);
+        continue;
+      }
+      liveDataPairs += 1;
       const signal = analyzePair(pair, { "15m": c15, "5m": c5, "1h": c1h });
       if (signal) signals.push(signal);
     } catch (err) {
@@ -789,6 +796,7 @@ async function scanMarkets(manual = false) {
     durationMs: Date.now() - started,
     exchange: EXCHANGE,
     pairs: state.pairs.length,
+    liveDataPairs,
     candidates: signals.length,
     accepted: accepted.length,
     fresh: fresh.length,
@@ -943,6 +951,7 @@ function printDryRun(summary) {
   console.log(`${BOT_NAME} dry run`);
   console.log(`Exchange: ${summary.exchange}`);
   console.log(`Pairs: ${summary.pairs}`);
+  console.log(`Pairs with live closed candles: ${summary.liveDataPairs}/${summary.pairs}`);
   console.log(`Duration: ${(summary.durationMs / 1000).toFixed(1)}s`);
   console.log(`Candidates: ${summary.candidates}`);
   console.log(`Above threshold: ${summary.accepted}`);
@@ -1030,11 +1039,11 @@ function resultsText(tracker = outcomes) {
     `Trial period: <b>${fmtDay(s.firstAlertAt)}</b> to <b>${fmtDay(s.lastAlertAt)}</b>\n` +
     `Day <b>${days}</b> of <b>${TRIAL_DAYS}</b>, <b>${s.completed}</b> of <b>${TRIAL_MIN_SETUPS}</b> completed setups\n\n` +
     `Total alerts published: <b>${s.total}</b>\n` +
-    `Entries activated: <b>${s.entered}</b>\n` +
-    `Entries never activated: <b>${s.neverActivated}</b>\n` +
+    `Awaiting Entry Price: <b>${s.awaitingEntry}</b>\n` +
+    `Entered and still being monitored: <b>${s.enteredMonitoring}</b>\n` +
     `Cancelled before entry: <b>${s.cancelled}</b>\n` +
-    `Still being monitored: <b>${s.stillMonitoring}</b>\n` +
-    `Expired without a result: <b>${s.expired}</b>\n` +
+    `Expired before entry: <b>${s.expiredBeforeEntry}</b>\n` +
+    `Expired after entry: <b>${s.expiredAfterEntry}</b>\n` +
     `Completed setups: <b>${s.completed}</b>\n\n` +
     `${legText("First Profit Target (1:1)", s.oneR)}\n\n` +
     `${legText("Final Profit Target (3:1)", s.threeR)}\n\n` +
@@ -1333,11 +1342,12 @@ async function main() {
 
   if (sendTest) {
     const signal = sampleSignal();
-    await sendSignalAlert(
+    const delivered = await sendSignalAlert(
       DEFAULT_OWNER_CHAT_ID,
       signal,
       `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(signal, signal.alertId)}`,
     );
+    if (!delivered) throw new Error("Telegram did not accept the controlled test alert.");
     console.log("Test alert sent to Telegram.");
     return;
   }

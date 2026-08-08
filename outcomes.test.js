@@ -234,6 +234,19 @@ test("unresolved setups expire without being scored", () => {
   assert.strictEqual(stats.expired, 1);
 });
 
+test("a reached first target remains scored when only the final leg expires", () => {
+  const first = run(recordFor(longSignal()), [candle(1, 99, 111)]);
+  const expired = run(first.record, [], ALERT_MS + EXPIRY_MS + MINUTE).record;
+  assert.strictEqual(expired.status, "expired");
+  assert.strictEqual(expired.r1Status, "tp");
+  assert.strictEqual(expired.r3Status, "void");
+
+  const stats = summarise([expired]);
+  assert.strictEqual(stats.oneR.resolved, 1, "the resolved 1:1 leg belongs in its sample");
+  assert.strictEqual(stats.oneR.tp, 1);
+  assert.strictEqual(stats.threeR.resolved, 0, "the unresolved 3:1 leg stays excluded");
+});
+
 test("a setup resolved just before expiry keeps its result", () => {
   const result = run(recordFor(longSignal()), [candle(1, 99, 131)], ALERT_MS + EXPIRY_MS + MINUTE);
   assert.strictEqual(result.record.status, "complete");
@@ -265,6 +278,19 @@ test("win rate and t-statistic need enough data", () => {
   assert(stats.oneR.tStat !== null, "two differing results define a t-statistic");
   // A single observation has no variance to measure.
   assert.strictEqual(summarise([win]).oneR.tStat, null);
+});
+
+test("lifecycle buckets are mutually exclusive and add up to total alerts", () => {
+  const awaiting = recordFor(longSignal(), "CR-LIFE-001");
+  const monitoring = run(recordFor(longSignal(), "CR-LIFE-002"), [candle(1, 99, 101)]).record;
+  const cancelled = run(recordFor(longSignal(), "CR-LIFE-003"), [candle(1, 88, 95)]).record;
+  const expiredBefore = run(recordFor(longSignal(), "CR-LIFE-004"), [], ALERT_MS + EXPIRY_MS + MINUTE).record;
+  const expiredAfter = run(recordFor(longSignal(), "CR-LIFE-005"), [candle(1, 99, 101)], ALERT_MS + EXPIRY_MS + MINUTE).record;
+  const complete = run(recordFor(longSignal(), "CR-LIFE-006"), [candle(1, 99, 131)]).record;
+  const stats = summarise([awaiting, monitoring, cancelled, expiredBefore, expiredAfter, complete]);
+  const lifecycleTotal = stats.awaitingEntry + stats.enteredMonitoring + stats.cancelled
+    + stats.expiredBeforeEntry + stats.expiredAfterEntry + stats.completed;
+  assert.strictEqual(lifecycleTotal, stats.total);
 });
 
 // ---------------------------------------------------------------------------
@@ -416,6 +442,7 @@ test("malformed persisted records are dropped, not crashed on", () => {
       { id: "CR-X-1", symbol: "BTCUSDT", side: "long", entry: "abc", stop: 1, tp1: 2, tp3: 3, r: 1 },
       { id: "CR-X-2", symbol: "BTCUSDT", side: "long", entry: 100, stop: 110, tp1: 110, tp3: 130, r: 10 },
       { id: "CR-X-3", symbol: "BTCUSDT", side: "banana", entry: 100, stop: 90, tp1: 110, tp3: 130, r: 10 },
+      { id: "CR-X-4", symbol: "BTCUSDT", side: "long", entry: 100, stop: 90, tp1: 111, tp3: 130, r: 10 },
     ]));
     const tracker = createOutcomeTracker({ file, fetchCandles: async () => [], logger: quietLogger });
     assert.strictEqual(tracker.records.length, 1);

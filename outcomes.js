@@ -195,6 +195,10 @@ function oneOf(value, allowed, fallback) {
   return allowed.includes(value) ? value : fallback;
 }
 
+function nearlyEqual(a, b) {
+  return Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+}
+
 /**
  * Accept a persisted row only if it can still be reasoned about. Anything
  * missing its identity or its price levels is dropped rather than repaired,
@@ -214,6 +218,11 @@ function sanitizeRecord(row) {
   if (entry <= 0 || r <= 0) return null;
   if (side === "long" && !(stop < entry && entry < tp1 && tp1 < tp3)) return null;
   if (side === "short" && !(stop > entry && entry > tp1 && tp1 > tp3)) return null;
+  const canonical = buildTradePlan({ side, price: entry, stop });
+  if (!canonical
+    || !nearlyEqual(r, canonical.r)
+    || !nearlyEqual(tp1, canonical.tp1)
+    || !nearlyEqual(tp3, canonical.tp3)) return null;
 
   const watchFromMs = Number(row.watchFromMs);
   const notified = row.notified && typeof row.notified === "object" ? row.notified : {};
@@ -468,8 +477,12 @@ function summarise(records, options = {}) {
   const times = sent.map((r) => Date.parse(r.sentAt)).filter(Number.isFinite).sort((a, b) => a - b);
 
   const entered = rows.filter((r) => r.entryStatus === "entered");
-  const cancelled = rows.filter((r) => r.entryStatus === "cancelled");
+  const awaitingEntry = rows.filter((r) => r.status === "open" && r.entryStatus === "pending");
+  const enteredMonitoring = rows.filter((r) => r.status === "open" && r.entryStatus === "entered");
+  const cancelled = rows.filter((r) => r.status === "cancelled");
   const expired = rows.filter((r) => r.status === "expired");
+  const expiredBeforeEntry = expired.filter((r) => r.entryStatus === "expired");
+  const expiredAfterEntry = expired.filter((r) => r.entryStatus === "entered");
   const openNow = rows.filter((r) => r.status === "open");
   const neverActivated = rows.filter((r) => r.entryStatus === "pending" || r.entryStatus === "cancelled" || r.entryStatus === "expired");
   const complete = rows.filter((r) => r.status === "complete");
@@ -480,13 +493,20 @@ function summarise(records, options = {}) {
     lastAlertAt: times.length ? new Date(times[times.length - 1]).toISOString() : null,
     entered: entered.length,
     neverActivated: neverActivated.length,
+    awaitingEntry: awaitingEntry.length,
+    enteredMonitoring: enteredMonitoring.length,
     cancelled: cancelled.length,
     stillMonitoring: openNow.length,
     expired: expired.length,
+    expiredBeforeEntry: expiredBeforeEntry.length,
+    expiredAfterEntry: expiredAfterEntry.length,
     completed: complete.length,
     dataGaps: rows.filter((r) => Number(r.dataGaps) > 0).length,
-    oneR: legSummary(complete, "r1Status", 1),
-    threeR: legSummary(complete, "r3Status", 3),
+    // Score each leg independently. If the first target was reached and the
+    // final leg later expired, the valid first-target result still belongs in
+    // the 1:1 sample while the unresolved 3:1 leg remains excluded.
+    oneR: legSummary(rows, "r1Status", 1),
+    threeR: legSummary(rows, "r3Status", 3),
     costs: options.costs || DEFAULT_COSTS,
   };
 }
