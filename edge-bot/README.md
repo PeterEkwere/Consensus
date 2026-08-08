@@ -1,5 +1,12 @@
 # edge-bot
 
+> **Status: research only. No tradable edge demonstrated.**
+>
+> The flow signals measured here have not beaten roughly 51% directional accuracy,
+> which is unprofitable once fees and slippage are paid. `researchMode` stays `true`,
+> the bot is not deployed, and it must not gate Consensus Reaper entries. The code is
+> kept for audit and history. Do not start it in production.
+
 A single-file Telegram bot that watches the crypto perp market and only messages you when several independent signals agree. The live research loop is configured for scalping: 1-minute observations with 5/15/60-minute forward evaluation. Free data only (Hyperliquid public API). Zero npm dependencies — just Node 18+.
 
 ## The idea: a courtroom, not a siren

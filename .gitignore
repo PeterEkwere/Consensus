@@ -2,7 +2,8 @@
 alerts.json
 signals.json
 state.json
-setups.json
+outcomes.json
+outcomes.json.tmp
 .env.pre-*
 node_modules/
 npm-debug.log*

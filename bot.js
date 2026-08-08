@@ -12,12 +12,17 @@
  * timeframe, the 1h chart gates the trade direction, and the 5m chart adds a
  * momentum trigger. Pairs are shown as TradingView symbols with chart links.
  *
+ * Every published alert is registered with the outcome tracker (outcomes.js),
+ * which resolves it against closed OKX 1m candles and reports how the setup
+ * behaved. The bot never reads or touches a trading account.
+ *
  * Commands:
  *   /start, /help        - command list
  *   /id                  - show current chat id
  *   /activate            - owner only, add this chat/group to alerts
  *   /deactivate          - owner only, remove this chat/group from alerts
  *   /status              - show runtime config
+ *   /results             - owner only, trial statistics
  *   /scan                - owner only, run a manual scan now
  *   /testalert           - owner only, send a sample alert to this chat
  *   /pause, /resume      - owner only, pause/resume auto alerts
@@ -33,7 +38,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const TelegramBot = require("node-telegram-bot-api");
-const { createSetupViewer } = require("./setup-viewer");
+const { buildTradePlan, createOutcomeTracker, DEFAULT_COSTS } = require("./outcomes");
 
 loadLocalEnv(path.join(__dirname, ".env"));
 
@@ -48,11 +53,12 @@ const OKX_BASE = "https://www.okx.com/api/v5/market";
 const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
 const ALERTS_FILE = path.join(__dirname, "alerts.json");
-const SETUPS_FILE = path.join(__dirname, "setups.json");
+const OUTCOMES_FILE = path.join(__dirname, "outcomes.json");
 const RISK_REWARD_RATIO = 3;
-const SETUP_VIEWER_BASE_URL = process.env.SETUP_VIEWER_BASE_URL || "";
-const SETUP_VIEWER_SECRET = process.env.SETUP_VIEWER_SECRET || "";
-const SETUP_VIEWER_PORT = Number(process.env.SETUP_VIEWER_PORT || 3080);
+const SETUP_TIMEFRAME = "15m";
+const SETUP_TIMEFRAME_LABEL = "15 minutes";
+// How often unresolved setups are checked against closed OKX 1m candles.
+const OUTCOME_POLL_MINUTES = 1;
 
 // Default universe: major, liquid pairs. Majors are tracked on futures so that
 // SHORT setups are actionable and TradingView links open the perpetual chart.
@@ -73,6 +79,11 @@ const DEFAULT_STATE = {
   useHtfGate: true,           // require the 1h trend to agree with the trade side
   minQuoteVolume24h: 5000000, // skip thin books: 24h quote volume floor (USDT)
   lastAlerts: {},
+  // Outcome monitoring. Unresolved setups are closed out after this many hours
+  // and reported separately, never counted as a win or a loss.
+  outcomeExpiryHours: 24,
+  feeRatePerSide: DEFAULT_COSTS.feeRatePerSide,
+  slippageRatePerSide: DEFAULT_COSTS.slippageRatePerSide,
 };
 
 const MARKET_LABELS = {
@@ -82,22 +93,14 @@ const MARKET_LABELS = {
 
 let state = loadJson(STATE_FILE, DEFAULT_STATE);
 state = migrateState(state);
-saveJson(STATE_FILE, state);
 
 const dryRun = process.argv.includes("--dry-run");
 const sendTest = process.argv.includes("--send-test");
-if (!dryRun && !TELEGRAM_BOT_TOKEN) {
-  console.error("Missing TELEGRAM_BOT_TOKEN. Set it in consensus_reaper/.env or as an environment variable.");
-  process.exit(1);
-}
-const bot = dryRun ? null : new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: !sendTest });
-const setupViewer = createSetupViewer({
-  baseUrl: SETUP_VIEWER_BASE_URL,
-  secret: SETUP_VIEWER_SECRET,
-  port: SETUP_VIEWER_PORT,
-  setupsFile: SETUPS_FILE,
-  fetchCandles: (pair, frame, limit) => fetchCandles(pair, frame, limit),
-});
+
+// Assigned by main(). Left null when this file is required by a test so that
+// nothing polls Telegram and no token is needed.
+let bot = null;
+let outcomes = null;
 
 // ---------------------------------------------------------------------------
 // State + env helpers
@@ -276,11 +279,6 @@ function fmtPrice(n) {
   return value.toFixed(2);
 }
 
-function fmtPct(n) {
-  const value = Number(n) || 0;
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
-}
-
 function pctChange(from, to) {
   if (!from) return 0;
   return ((to - from) / from) * 100;
@@ -330,7 +328,7 @@ function parsePairInput(input) {
 // OKX data adapter
 // ---------------------------------------------------------------------------
 
-const OKX_BAR = { "5m": "5m", "15m": "15m", "1h": "1H" };
+const OKX_BAR = { "1m": "1m", "5m": "5m", "15m": "15m", "1h": "1H" };
 
 // "BTCUSDT" -> "BTC-USDT" (OKX uses dashed instrument ids).
 function okxInstId(pair) {
@@ -633,6 +631,16 @@ function analyzePair(pair, tf) {
   const winner = long.score >= short.score ? long : short;
   if (winner.score < 45) return null;
 
+  // Reject anything that cannot be published and monitored deterministically:
+  // missing, non-finite, zero or directionally invalid entry/stop/target.
+  const plan = buildTradePlan(winner);
+  if (!plan) return null;
+  winner.entry = plan.entry;
+  winner.tp1 = plan.tp1;
+  winner.tp3 = plan.tp3;
+  winner.r = plan.r;
+  winner.target = plan.tp3;
+
   // 1h consensus gate: never fight the higher timeframe when it clearly opposes.
   const opposesH1 = (winner.side === "long" && trendH1 === "bearish")
     || (winner.side === "short" && trendH1 === "bullish");
@@ -645,6 +653,7 @@ function analyzePair(pair, tf) {
   winner.tvSymbol = pair.tv;
   winner.name = pair.label;
   winner.url = tvChartUrl(pair.tv);
+  winner.timeframe = SETUP_TIMEFRAME;
   winner.trendH1 = trendH1;
   winner.trendM5 = trendM5;
   winner.changeM15 = lastMovePct;
@@ -710,28 +719,41 @@ function scoreSide(side, ctx) {
   const stop = long
     ? Math.max(0, Math.min(ctx.levels.support || last.close - ctx.volatility, last.close - ctx.volatility * 1.25))
     : Math.max(ctx.levels.resistance || last.close + ctx.volatility, last.close + ctx.volatility * 1.25);
-  const risk = Math.abs(last.close - stop) || ctx.volatility;
+  // R is measured from the exact entry to invalidation, with no fallback: a
+  // setup whose risk cannot be measured is rejected rather than guessed at, so
+  // the published 1:1 and 3:1 targets are always consistent with the entry.
+  const risk = Math.abs(last.close - stop);
   const target = long
     ? last.close + risk * RISK_REWARD_RATIO
     : last.close - risk * RISK_REWARD_RATIO;
-  const entryLow = long ? last.close - ctx.volatility * 0.25 : last.close - ctx.volatility * 0.1;
-  const entryHigh = long ? last.close + ctx.volatility * 0.1 : last.close + ctx.volatility * 0.25;
 
   confirmations.push(...reasons);
   return {
     side,
     score: Math.round(rawScore),
     price: last.close,
-    entryLow,
-    entryHigh,
     stop,
     target,
     riskRewardRatio: RISK_REWARD_RATIO,
     rsi: ctx.rsiValue,
     trend: ctx.trend,
     confirmations,
+    // Kept for internal diagnostics and ranking, never shown in Telegram.
+    confirmationDetails: reasons.map((label, i) => ({ label, points: score[i] })),
     time: new Date(last.time).toISOString(),
   };
+}
+
+/** The three highest-weighted reasons, used for the "Why this setup" line. */
+function topConfirmations(signal, count = 3) {
+  const details = Array.isArray(signal.confirmationDetails) ? signal.confirmationDetails : null;
+  if (details && details.length) {
+    return details.slice()
+      .sort((a, b) => b.points - a.points)
+      .slice(0, count)
+      .map((d) => d.label);
+  }
+  return (signal.confirmations || []).slice(0, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -814,75 +836,107 @@ function markCooldown(signal) {
 }
 
 async function broadcastSignal(signal) {
-  const text = formatSignal(signal);
-  const setupUrl = setupViewer.createSetup(signal);
-  const alert = {
-    sentAt: new Date().toISOString(),
-    chatIds: state.alertChatIds,
-    setupUrl,
-    signal,
-  };
-  appendJsonArray(ALERTS_FILE, alert, 500);
-  for (const chatId of state.alertChatIds) {
-    await sendSignalAlert(chatId, signal, text, setupUrl);
+  const sentAt = new Date().toISOString();
+  const record = outcomes ? outcomes.track(signal, sentAt) : null;
+  if (outcomes && !record) {
+    // buildTradePlan already logged the reason. Never publish a setup we cannot
+    // measure: an untrackable alert would pollute the trial.
+    return null;
   }
+  const alertId = record ? record.id : null;
+  const text = formatSignal(signal, alertId);
+  appendJsonArray(ALERTS_FILE, { sentAt, alertId, chatIds: state.alertChatIds, signal }, 500);
+  for (const chatId of state.alertChatIds) {
+    await sendSignalAlert(chatId, signal, text);
+  }
+  return record;
 }
 
-function signalButtons(signal, setupUrl) {
-  const row = [];
-  if (setupUrl) row.push({ text: "View complete setup", url: setupUrl });
-  row.push({ text: "Open TradingView", url: signal.url });
-  return { inline_keyboard: [row] };
+function signalButtons(signal) {
+  return { inline_keyboard: [[{ text: "Open TradingView", url: signal.url }]] };
 }
 
-function sendSignalAlert(chatId, signal, text = formatSignal(signal), setupUrl = null) {
-  const viewerUrl = setupUrl || setupViewer.createSetup(signal);
+function sendSignalAlert(chatId, signal, text = formatSignal(signal)) {
   return sendHtml(chatId, text, {
-    reply_markup: signalButtons(signal, viewerUrl),
+    reply_markup: signalButtons(signal),
   });
 }
 
-function formatSignal(signal) {
-  const direction = signal.side === "long" ? "LONG SETUP" : "SHORT SETUP";
-  const conf = signal.confirmations.slice(0, 6)
-    .map((c) => `- ${esc(c)}`)
-    .join("\n");
-  const time = new Date(signal.time).toLocaleString("en-GB", {
-    timeZone: "Africa/Lagos",
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  const marketName = `${EXCHANGE} ${MARKET_LABELS[signal.market] || signal.market}`;
+// Plain-language direction wording. Readers are not assumed to know what a
+// long, a short, a stop loss or an R multiple is.
+function directionWords(side) {
+  return side === "long"
+    ? { emoji: "🟢", action: "BUY", expectation: "Price is expected to rise" }
+    : { emoji: "🔴", action: "SELL", expectation: "Price is expected to fall" };
+}
 
-  return `<b>${BOT_NAME}</b>\n\n` +
-    `<b>${esc(signal.name)} | ${direction}</b>\n` +
+function formatSignal(signal, alertId = signal.alertId || null) {
+  const plan = buildTradePlan(signal);
+  if (!plan) return `<b>${BOT_NAME}</b>\n\nThis setup was rejected: its entry, stop loss and targets are not consistent.`;
+
+  const words = directionWords(plan.side);
+  const marketName = `${EXCHANGE} ${MARKET_LABELS[signal.market] || signal.market}`;
+  const why = topConfirmations(signal, 3).map((reason) => esc(reason)).join("\n");
+
+  return `${words.emoji} <b>${esc(signal.name)} — ${words.action}</b>\n` +
+    `${words.expectation}\n\n` +
     `Exchange: <b>${esc(marketName)}</b>\n` +
-    `Timeframe: <b>15m</b> (multi-TF consensus)\n` +
-    `Time: <b>${esc(time)} WAT</b>\n\n` +
-    `<b>Setup Quality</b>\n` +
-    `Confidence: <b>${signal.score}%</b>\n` +
-    `Trend: <b>${esc(signal.trend)}</b>\n` +
-    `RSI: <b>${signal.rsi.toFixed(1)}</b>\n\n` +
-    `<b>Timeframe Consensus</b>\n` +
-    `5m: <b>${esc(signal.trendM5)}</b>\n` +
-    `15m: <b>${esc(signal.trend)}</b>\n` +
-    `1h: <b>${esc(signal.trendH1)}</b>\n\n` +
-    `<b>Confluence</b>\n${conf}\n\n` +
-    `<b>Market Context</b>\n` +
-    `Price: <code>${fmtPrice(signal.price)}</code>\n` +
-    `15m change: <b>${fmtPct(signal.changeM15)}</b>\n` +
-    `1h change: <b>${fmtPct(signal.changeH1)}</b>\n` +
-    `24h change: <b>${fmtPct(signal.changeH24)}</b>\n` +
-    `24h volume: <b>${fmtUsd(signal.volumeH24Usd)}</b>\n\n` +
-    `<b>Trade Map</b>\n` +
-    `Entry zone: <code>${fmtPrice(signal.entryLow)} - ${fmtPrice(signal.entryHigh)}</code>\n` +
-    `Invalidation: <code>${fmtPrice(signal.stop)}</code>\n` +
-    `Target (${signal.riskRewardRatio}:1 RR): <code>${fmtPrice(signal.target)}</code>\n\n` +
-    `<b>TradingView</b>\n<code>${esc(signal.tvSymbol)}</code>\n\n` +
-    `<i>Manual execution only. This is a scanner alert, not financial advice.</i>`;
+    `Chart timeframe: <b>${SETUP_TIMEFRAME_LABEL}</b>\n\n` +
+    `Entry Price: <code>${fmtPrice(plan.entry)}</code>\n` +
+    `Stop Loss: <code>${fmtPrice(plan.stop)}</code>\n` +
+    `First Profit Target (1:1): <code>${fmtPrice(plan.tp1)}</code>\n` +
+    `Final Profit Target (3:1): <code>${fmtPrice(plan.tp3)}</code>\n\n` +
+    `Why this setup:\n${why}\n\n` +
+    (alertId ? `Alert ID: <code>${esc(alertId)}</code>\n\n` : "") +
+    `<i>1:1 means the target distance equals the amount risked.\n` +
+    `3:1 means the target distance is three times the amount risked.\n` +
+    `Tracking uses OKX market prices and does not read your trading account.</i>`;
+}
+
+// ---------------------------------------------------------------------------
+// Outcome notifications
+// ---------------------------------------------------------------------------
+
+const RESULT_WORDS = {
+  tp: "TARGET REACHED",
+  sl: "STOP LOSS REACHED",
+  open: "still being monitored",
+  void: "no result recorded",
+};
+
+function formatOutcome(event, record) {
+  const words = directionWords(record.side);
+  const head = `<b>${esc(record.name)} — ${words.action}</b>`;
+  const id = `Alert ID: <code>${esc(record.id)}</code>`;
+
+  if (event.type === "first_target") {
+    return `✅ <b>FIRST PROFIT TARGET REACHED</b>\n\n` +
+      `${head}\n` +
+      `Entry Price: <code>${fmtPrice(record.entry)}</code>\n` +
+      `First Profit Target (1:1): <code>${fmtPrice(record.tp1)}</code>\n\n` +
+      `1:1 setup result: <b>${RESULT_WORDS.tp}</b>\n` +
+      `The final 3:1 target is still being monitored.\n\n` +
+      `${id}`;
+  }
+
+  const r1 = RESULT_WORDS[record.r1Status] || RESULT_WORDS.void;
+  const r3 = RESULT_WORDS[record.r3Status] || RESULT_WORDS.void;
+  let banner = "⚠️ <b>SETUP MONITORING COMPLETE</b>";
+  if (record.r1Status === "tp" && record.r3Status === "tp") banner = "🏆 <b>FINAL PROFIT TARGET REACHED</b>";
+  else if (record.r1Status === "sl" && record.r3Status === "sl") banner = "❌ <b>STOP LOSS REACHED</b>";
+
+  return `${banner}\n\n` +
+    `${head}\n\n` +
+    `1:1 setup result: <b>${r1}</b>\n` +
+    `3:1 setup result: <b>${r3}</b>\n\n` +
+    `${id}`;
+}
+
+async function broadcastOutcome(event, record) {
+  const text = formatOutcome(event, record);
+  for (const chatId of state.alertChatIds) {
+    await sendHtml(chatId, text);
+  }
 }
 
 function printDryRun(summary) {
@@ -933,8 +987,62 @@ function statusText() {
     `<b>Alerts</b>\n` +
     `Chats: ${chats || "none"}\n` +
     `Stored alerts: <b>${alerts.length}</b>\n` +
-    `One-tap setup viewer: <b>${setupViewer.enabled ? "on" : "off"}</b>\n` +
+    `Setups being monitored: <b>${outcomes ? outcomes.summary().stillMonitoring : 0}</b>\n` +
     `Last scan: <code>${esc(lastScan)}</code>`;
+}
+
+// ---------------------------------------------------------------------------
+// Trial results
+// ---------------------------------------------------------------------------
+
+const TRIAL_MIN_SETUPS = 50;
+const TRIAL_DAYS = 30;
+
+function fmtDay(iso) {
+  if (!iso) return "not started";
+  return new Date(iso).toISOString().slice(0, 10);
+}
+
+function fmtR(value) {
+  const n = Number(value) || 0;
+  return `${n >= 0 ? "+" : ""}${n.toFixed(3)}`;
+}
+
+function legText(title, leg) {
+  if (!leg.resolved) return `<b>${title}</b>\nNo completed setups yet.`;
+  return `<b>${title}</b>\n` +
+    `Target hits: <b>${leg.tp}</b>\n` +
+    `Stop losses: <b>${leg.sl}</b>\n` +
+    `Success rate: <b>${leg.winRate.toFixed(1)}%</b>\n` +
+    `Average result after estimated trading costs: <b>${fmtR(leg.netExpectancyR)}</b> times the amount risked\n` +
+    `Statistical confidence (t-statistic): <b>${leg.tStat === null ? "not enough data" : leg.tStat.toFixed(2)}</b>`;
+}
+
+function resultsText(tracker = outcomes) {
+  if (!tracker) return `<b>${BOT_NAME}</b>\n\nOutcome monitoring is not running.`;
+  const s = tracker.summary();
+  const costPct = ((s.costs.feeRatePerSide + s.costs.slippageRatePerSide) * 2 * 100).toFixed(2);
+  const days = s.firstAlertAt
+    ? Math.floor((Date.now() - Date.parse(s.firstAlertAt)) / 86400000) + 1
+    : 0;
+
+  return `<b>${BOT_NAME} — Results</b>\n\n` +
+    `Trial period: <b>${fmtDay(s.firstAlertAt)}</b> to <b>${fmtDay(s.lastAlertAt)}</b>\n` +
+    `Day <b>${days}</b> of <b>${TRIAL_DAYS}</b>, <b>${s.completed}</b> of <b>${TRIAL_MIN_SETUPS}</b> completed setups\n\n` +
+    `Total alerts published: <b>${s.total}</b>\n` +
+    `Entries activated: <b>${s.entered}</b>\n` +
+    `Entries never activated: <b>${s.neverActivated}</b>\n` +
+    `Cancelled before entry: <b>${s.cancelled}</b>\n` +
+    `Still being monitored: <b>${s.stillMonitoring}</b>\n` +
+    `Expired without a result: <b>${s.expired}</b>\n` +
+    `Completed setups: <b>${s.completed}</b>\n\n` +
+    `${legText("First Profit Target (1:1)", s.oneR)}\n\n` +
+    `${legText("Final Profit Target (3:1)", s.threeR)}\n\n` +
+    `<i>A t-statistic above 2 is stronger evidence that the result may not be random.</i>\n\n` +
+    `Estimated trading costs assumed: <b>${costPct}%</b> per completed setup ` +
+    `(${(s.costs.feeRatePerSide * 100).toFixed(3)}% fee and ${(s.costs.slippageRatePerSide * 100).toFixed(3)}% slippage on entry and exit).\n` +
+    `Setups expire after <b>${s.expiryHours} hours</b> without a result.` +
+    (s.dataGaps ? `\nSetups with incomplete monitoring data: <b>${s.dataGaps}</b>` : "");
 }
 
 function commandPattern(command) {
@@ -944,12 +1052,13 @@ function commandPattern(command) {
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
     `Multi-timeframe market-structure scanner for major ${EXCHANGE} pairs.\n` +
-    `Spot and futures, 5m/15m/1h consensus, one-tap trade maps.\n\n` +
+    `Spot and futures, 5m/15m/1h consensus, with direct TradingView links.\n\n` +
     `<b>Commands</b>\n` +
     `/id - show this chat id\n` +
     `/activate - owner only, enable alerts here\n` +
     `/deactivate - owner only, disable alerts here\n` +
     `/status - scanner status\n` +
+    `/results - owner only, how published setups performed\n` +
     `/scan - owner only, manual scan\n` +
     `/testalert - owner only, preview alert rendering\n` +
     `/pause - owner only, pause alerts\n` +
@@ -960,11 +1069,18 @@ function helpText() {
     `/removepair BTCUSDT - owner only\n` +
     `/resetpairs - owner only, restore defaults\n` +
     `/threshold 65 - owner only\n\n` +
-    `<i>The setup viewer is read-only. No wallet. No automatic trading.</i>`;
+    `<b>What the alerts mean</b>\n` +
+    `BUY means the setup expects price to rise.\n` +
+    `SELL means the setup expects price to fall.\n` +
+    `The Stop Loss is where the setup becomes invalid.\n` +
+    `The 1:1 target offers a potential reward equal to the planned risk.\n` +
+    `The 3:1 target offers a potential reward three times the planned risk.\n` +
+    `Results track the published setup using OKX prices, not your personal trading account.\n\n` +
+    `<i>Alerts are read-only. No wallet. No automatic trading.</i>`;
 }
 
 function sampleSignal() {
-  return {
+  const signal = {
     exchange: EXCHANGE,
     market: "futures",
     symbol: "BTCUSDT",
@@ -973,11 +1089,9 @@ function sampleSignal() {
     side: "long",
     score: 84,
     price: 64250,
-    entryLow: 64180,
-    entryHigh: 64320,
     stop: 63680,
-    target: 65960,
     riskRewardRatio: RISK_REWARD_RATIO,
+    timeframe: SETUP_TIMEFRAME,
     rsi: 58.4,
     trend: "bullish",
     trendH1: "bullish",
@@ -987,15 +1101,23 @@ function sampleSignal() {
     changeH24: 9.72,
     volumeH24Usd: 5200000000,
     confirmations: [
-      "Format preview only",
-      "Bullish market structure",
       "Break and retest above prior resistance",
+      "Bullish market structure",
       "1h trend aligned",
       "5m momentum aligned",
     ],
+    confirmationDetails: [
+      { label: "Break and retest above prior resistance", points: 24 },
+      { label: "Bullish market structure", points: 18 },
+      { label: "1h trend aligned", points: 12 },
+      { label: "5m momentum aligned", points: 6 },
+    ],
     time: new Date().toISOString(),
     url: "https://www.tradingview.com/chart/?symbol=OKX%3ABTCUSDT.P",
+    alertId: "CR-BTC-PREVIEW-001",
   };
+  const plan = buildTradePlan(signal);
+  return { ...signal, entry: plan.entry, tp1: plan.tp1, tp3: plan.tp3, r: plan.r, target: plan.tp3 };
 }
 
 function pairsText() {
@@ -1010,7 +1132,7 @@ function pairsText() {
 // Command handlers
 // ---------------------------------------------------------------------------
 
-if (!dryRun) {
+function registerCommands() {
   bot.onText(commandPattern("start"), (msg) => {
     sendHtml(msg.chat.id, helpText());
   });
@@ -1047,6 +1169,11 @@ if (!dryRun) {
 
   bot.onText(commandPattern("status"), (msg) => {
     sendHtml(msg.chat.id, statusText());
+  });
+
+  bot.onText(commandPattern("results"), (msg) => {
+    if (!ownerGuard(msg)) return;
+    sendHtml(msg.chat.id, resultsText());
   });
 
   bot.onText(commandPattern("pause"), (msg) => {
@@ -1149,30 +1276,36 @@ if (!dryRun) {
 // Runner
 // ---------------------------------------------------------------------------
 
-async function autoLoop() {
-  if (!dryRun && setupViewer.enabled) {
-    const address = await setupViewer.start();
-    console.log(`Setup viewer listening on ${address.address}:${address.port}`);
-  } else if (!dryRun) {
-    console.log("Setup viewer disabled. Configure SETUP_VIEWER_BASE_URL and SETUP_VIEWER_SECRET to enable it.");
-  }
-  if (sendTest) {
-    const signal = sampleSignal();
-    await sendSignalAlert(DEFAULT_OWNER_CHAT_ID, signal, `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(signal)}`);
-    console.log("Test alert sent to Telegram.");
-    return;
-  }
-  if (dryRun) {
-    await scanMarkets(false);
-    return;
-  }
-  console.log(`${BOT_NAME} is running.`);
-  console.log(`Owner ID: ${OWNER_ID}`);
-  console.log(`Alert chats: ${state.alertChatIds.join(", ")}`);
-  console.log(`Exchange: ${EXCHANGE}, pairs: ${state.pairs.length}`);
+function createTracker() {
+  return createOutcomeTracker({
+    file: OUTCOMES_FILE,
+    expiryHours: state.outcomeExpiryHours,
+    costs: {
+      feeRatePerSide: state.feeRatePerSide,
+      slippageRatePerSide: state.slippageRatePerSide,
+    },
+    fetchCandles: (pair, frame, limit) => fetchCandles(pair, frame, limit),
+    notify: broadcastOutcome,
+  });
+}
 
-  await sendToOwner(`<b>${BOT_NAME}</b>\n\nBot started.\nUse /id in your group, then /activate to enable group alerts.`);
+/**
+ * Resolve published setups against closed OKX 1m candles. Runs independently of
+ * the scan loop so outcomes land promptly, and survives its own failures: a
+ * monitoring error is logged, never turned into a result.
+ */
+async function monitorLoop() {
+  while (true) {
+    try {
+      await outcomes.poll();
+    } catch (err) {
+      console.error("Outcome monitoring failed:", err.message);
+    }
+    await sleep(OUTCOME_POLL_MINUTES * 60 * 1000);
+  }
+}
 
+async function scanLoop() {
   while (true) {
     try {
       if (!state.paused) await scanMarkets(false);
@@ -1183,7 +1316,63 @@ async function autoLoop() {
   }
 }
 
-autoLoop().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+async function main() {
+  saveJson(STATE_FILE, state);
+
+  if (dryRun) {
+    await scanMarkets(false);
+    return;
+  }
+
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error("Missing TELEGRAM_BOT_TOKEN. Set it in consensus_reaper/.env or as an environment variable.");
+    process.exit(1);
+  }
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: !sendTest });
+  outcomes = createTracker();
+
+  if (sendTest) {
+    const signal = sampleSignal();
+    await sendSignalAlert(
+      DEFAULT_OWNER_CHAT_ID,
+      signal,
+      `<b>TEST ALERT - FORMAT PREVIEW</b>\n\n${formatSignal(signal, signal.alertId)}`,
+    );
+    console.log("Test alert sent to Telegram.");
+    return;
+  }
+
+  registerCommands();
+
+  console.log(`${BOT_NAME} is running.`);
+  console.log(`Owner ID: ${OWNER_ID}`);
+  console.log(`Alert chats: ${state.alertChatIds.join(", ")}`);
+  console.log(`Exchange: ${EXCHANGE}, pairs: ${state.pairs.length}`);
+  console.log(`Monitoring ${outcomes.summary().stillMonitoring} unresolved setup(s) from disk.`);
+
+  await sendToOwner(`<b>${BOT_NAME}</b>\n\nBot started.\nUse /id in your group, then /activate to enable group alerts.`);
+
+  await Promise.all([scanLoop(), monitorLoop()]);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+// Exported for the test suites. Requiring this file starts nothing.
+module.exports = {
+  BOT_NAME,
+  analyzePair,
+  createTracker,
+  directionWords,
+  formatOutcome,
+  formatSignal,
+  helpText,
+  resultsText,
+  sampleSignal,
+  signalButtons,
+  topConfirmations,
+};

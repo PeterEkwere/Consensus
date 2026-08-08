@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node bot.js",
     "scan": "node bot.js --dry-run",
-    "test": "node setup-viewer.test.js && node edge-bot/edge-bot.js selftest"
+    "test": "node outcomes.test.js && node bot.test.js && node edge-bot/edge-bot.js selftest"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0"
