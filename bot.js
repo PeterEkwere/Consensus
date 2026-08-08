@@ -40,6 +40,10 @@ const https = require("https");
 const TelegramBot = require("node-telegram-bot-api");
 const { buildTradePlan, createOutcomeTracker, DEFAULT_COSTS } = require("./outcomes");
 
+// Runtime ledgers can contain operational details. Keep every newly-created
+// file private even when the process manager itself was started with umask 022.
+process.umask(0o077);
+
 loadLocalEnv(path.join(__dirname, ".env"));
 
 const BOT_NAME = "Consensus Reaper";

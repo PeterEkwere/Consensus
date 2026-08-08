@@ -31,6 +31,10 @@
 const fs = require('fs');
 const path = require('path');
 
+// Journals and wallet-cohort state stay private regardless of the parent
+// process manager's default file-creation mask.
+process.umask(0o077);
+
 /* ============================== CONFIG ============================== */
 
 const CONFIG = {
