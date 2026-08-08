@@ -37,7 +37,8 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
-const TelegramBot = require("node-telegram-bot-api");
+const telegramApi = require("node-telegram-bot-api");
+const TelegramBot = telegramApi.TelegramBot || telegramApi;
 const { buildTradePlan, createOutcomeTracker, DEFAULT_COSTS } = require("./outcomes");
 
 // Runtime ledgers can contain operational details. Keep every newly-created
@@ -254,7 +255,7 @@ function sendHtml(chatId, text, extra = {}) {
   if (!bot) return Promise.resolve(false);
   return bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
-    disable_web_page_preview: true,
+    link_preview_options: { is_disabled: true },
     ...extra,
   }).then(() => true).catch((err) => {
     console.error("Telegram send failed:", err.message);

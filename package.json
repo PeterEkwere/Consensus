@@ -9,6 +9,6 @@
     "test": "node outcomes.test.js && node bot.test.js && node edge-bot/edge-bot.js selftest"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^1.2.0"
   }
 }
