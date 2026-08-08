@@ -1065,27 +1065,24 @@ function commandPattern(command) {
 
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
-    `Multi-timeframe market-structure scanner for major ${EXCHANGE} pairs.\n` +
-    `Spot and futures, 5m/15m/1h consensus, with direct TradingView links.\n\n` +
-    `<b>Commands</b>\n` +
-    `/id - show this chat id\n` +
-    `/activate - owner only, enable alerts here\n` +
-    `/deactivate - owner only, disable alerts here\n` +
-    `/status - scanner status\n` +
-    `/results - owner only, how published setups performed\n` +
-    `/scan - owner only, manual scan\n` +
-    `/testalert - owner only, preview alert rendering\n` +
-    `/pause - owner only, pause alerts\n` +
-    `/resume - owner only, resume alerts\n` +
-    `/pairs - list tracked pairs\n` +
-    `/addpair BTCUSDT - owner only, add spot pair\n` +
-    `/addpair BTCUSDT futures - owner only, add futures pair\n` +
-    `/removepair BTCUSDT - owner only\n` +
-    `/resetpairs - owner only, restore defaults\n` +
-    `/threshold 65 - owner only\n\n` +
-    `<b>What the alerts mean</b>\n` +
+    `Clear crypto setup alerts using closed ${SETUP_TIMEFRAME_LABEL} candles from ${EXCHANGE}.\n\n` +
+    `<b>Receive alerts in a group</b>\n` +
+    `1. Add this bot to the group.\n` +
+    `2. From your own account, send /activate in the group.\n` +
+    `3. The bot will save the group automatically.\n\n` +
+    `<b>Main commands</b>\n` +
+    `/activate - send future alerts to this chat or group\n` +
+    `/deactivate - stop alerts in this chat or group\n` +
+    `/status - check whether the scanner is running\n` +
+    `/results - see how published setups performed\n` +
+    `/scan - check the market now\n` +
+    `/pause - pause automatic alerts\n` +
+    `/resume - resume automatic alerts\n` +
+    `/id - show this chat or group's Telegram number\n\n` +
+    `<b>Reading an alert</b>\n` +
     `BUY means the setup expects price to rise.\n` +
     `SELL means the setup expects price to fall.\n` +
+    `The Entry Price is the planned starting price.\n` +
     `The Stop Loss is where the setup becomes invalid.\n` +
     `The 1:1 target offers a potential reward equal to the planned risk.\n` +
     `The 3:1 target offers a potential reward three times the planned risk.\n` +

@@ -357,13 +357,18 @@ section("help");
 
 test("help explains buy, sell, the stop and both targets", () => {
   const text = helpText();
+  assert(text.includes("Receive alerts in a group"));
+  assert(text.includes("send /activate in the group"));
   assert(text.includes("BUY means the setup expects price to rise."));
   assert(text.includes("SELL means the setup expects price to fall."));
+  assert(text.includes("The Entry Price is the planned starting price."));
   assert(text.includes("The Stop Loss is where the setup becomes invalid."));
   assert(text.includes("The 1:1 target offers a potential reward equal to the planned risk."));
   assert(text.includes("The 3:1 target offers a potential reward three times the planned risk."));
   assert(text.includes("not your personal trading account"));
   assert(text.includes("/results"), "the results command is documented");
+  assert(!text.includes("/addpair"), "advanced pair editing stays out of the simple help text");
+  assert(!text.includes("/threshold"), "advanced threshold editing stays out of the simple help text");
 });
 
 // ---------------------------------------------------------------------------
