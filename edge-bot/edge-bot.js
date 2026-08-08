@@ -276,16 +276,21 @@ function journalStatus(file = CONFIG.journalFile) {
   }
 
   const silentWitnesses = CONFIG.scoredWitnesses.filter((w) => witnessCalls[w] === 0);
+  const observedVotingCapacity = CONFIG.scoredWitnesses.length - silentWitnesses.length;
   if (witnessCalls.whales === 0 && !rows.some((r) => r.walletDirs && Object.keys(r.walletDirs).length)) {
     console.log('READINESS: no tracked-wallet data in this window. Configure wallets and collect a new one.');
   } else if (sizeFlowRows === 0) {
     console.log('READINESS: held-position data exists, but real wallet size changes were not recorded in this legacy window.');
-  } else if (silentWitnesses.length) {
-    console.log(`READINESS: pipeline healthy, but scored witness(es) ${silentWitnesses.join('/')} produced no calls — the score cannot reach its threshold. Diagnose before collecting further.`);
+  } else if (observedVotingCapacity < CONFIG.alertScore) {
+    console.log(`READINESS: pipeline healthy, but only ${observedVotingCapacity} scored witness(es) made calls in this window, so the observed data could not reach threshold ${CONFIG.alertScore}. Diagnose before collecting further.`);
   } else if (durationDays < 14) {
-    console.log('READINESS: the full witnesses are present, but this is an early diagnostic window; keep collecting for several weeks.');
+    const silentNote = silentWitnesses.length
+      ? ` ${silentWitnesses.join('/')} made no call yet, but the other ${observedVotingCapacity} observed witnesses can still reach threshold ${CONFIG.alertScore}.`
+      : ' All scored witnesses have made calls.';
+    console.log(`READINESS: pipeline healthy; this is an early diagnostic window.${silentNote} Keep collecting for several weeks.`);
   } else {
-    console.log('READINESS: enough elapsed time for a first evaluation; statistical confidence still depends on non-overlapping signal counts.');
+    const silentNote = silentWitnesses.length ? ` Scored witness(es) ${silentWitnesses.join('/')} remained silent and should be reviewed.` : '';
+    console.log(`READINESS: enough elapsed time for a first evaluation; statistical confidence still depends on non-overlapping signal counts.${silentNote}`);
   }
 }
 
@@ -1504,6 +1509,8 @@ function selftest() {
   check('funding + oi + whales agreeing reaches the max score',
     scoreOf({ dirs: { funding: 1, oi: 1, liq: -1, whales: 1 } }) === maxScore());
   check('alert threshold is reachable by the scored witnesses', CONFIG.alertScore <= maxScore());
+  check('one silent witness does not falsely make a 2-of-3 threshold unreachable',
+    CONFIG.scoredWitnesses.length - 1 >= CONFIG.alertScore);
   check('unproven witnesses cannot send trade alerts', CONFIG.researchMode === true);
   check('opposing witnesses cancel rather than accumulate',
     scoreOf({ dirs: { funding: -1, oi: 1, whales: 1 } }) === 1);
