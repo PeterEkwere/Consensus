@@ -10,6 +10,7 @@ outcomes.json.tmp
 .scheduler-*.lock
 .scheduler-*.status
 .scheduler-*.status.tmp.*
+.scheduler-ssh-*
 .scheduler.log
 .scheduler.log.1
 .env.pre-*

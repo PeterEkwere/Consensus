@@ -31,6 +31,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
 // __DIR__ is <home>/domains/forefada.com/public_html/staging/public/<random>.
 $accountRoot = dirname(__DIR__, 6);
 $repo = $accountRoot . '/.consensus-reaper';
+$accountUser = basename($accountRoot);
 $secretFile = $repo . '/.cron-trigger-secret';
 $runner = $repo . '/deploy/scheduled-runner.sh';
 
@@ -44,7 +45,9 @@ $task = (string) ($_GET['task'] ?? '');
 if (!in_array($task, ['consensus', 'edge'], true)) {
     finish(404, ['ok' => false]);
 }
-if (!is_dir($repo) || !is_file($runner)) {
+$sshKey = $repo . '/.scheduler-ssh-' . $task;
+$knownHosts = $repo . '/.scheduler-ssh-known-hosts';
+if (!is_dir($repo) || !is_file($runner) || !is_file($sshKey) || !is_file($knownHosts)) {
     finish(503, ['ok' => false, 'status' => 'runtime-unavailable']);
 }
 
@@ -69,11 +72,22 @@ $environment = [
     'LANG' => 'C.UTF-8',
 ];
 $options = ['bypass_shell' => true];
-$launchCommand = sprintf(
-    'nohup /bin/sh %s %s >/dev/null 2>&1 </dev/null &',
-    escapeshellarg($runner),
-    escapeshellarg($task),
-);
+$sshCommand = [
+    '/usr/bin/ssh',
+    '-i', $sshKey,
+    '-p', '65002',
+    '-o', 'BatchMode=yes',
+    '-o', 'IdentitiesOnly=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', 'UserKnownHostsFile=' . $knownHosts,
+    '-o', 'ConnectTimeout=10',
+    '-o', 'ConnectionAttempts=1',
+    $accountUser . '@127.0.0.1',
+    'scheduled',
+];
+$launchCommand = 'nohup '
+    . implode(' ', array_map('escapeshellarg', $sshCommand))
+    . ' >/dev/null 2>&1 </dev/null &';
 $pipes = [];
 $process = @proc_open(['/bin/sh', '-c', $launchCommand], $descriptors, $pipes, $repo, $environment, $options);
 if (!is_resource($process)) {
