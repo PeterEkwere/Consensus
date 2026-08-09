@@ -7,6 +7,7 @@ outcomes.json.tmp
 .cron-trigger-secret
 .cron-gateway-path
 .cron-job-ids.json
+.github-webhook-secret
 .scheduler-*.lock
 .scheduler-*.status
 .scheduler-*.status.tmp.*
