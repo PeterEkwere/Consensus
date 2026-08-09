@@ -62,10 +62,12 @@ if (strlen($secret) < 32 || strlen($provided) < 32 || !hash_equals($secret, $pro
 $task = (string) ($_GET['task'] ?? '');
 $tasks = [
     'consensus' => [
+        'script' => $repo . '/bot.js',
         'command' => [$node, '--max-old-space-size=96', $repo . '/bot.js', '--scheduled-run'],
         'timeout' => 52,
     ],
     'edge' => [
+        'script' => $repo . '/edge-bot/edge-bot.js',
         'command' => [$node, '--max-old-space-size=96', $repo . '/edge-bot/edge-bot.js', 'scheduled-run'],
         'timeout' => 48,
     ],
@@ -73,7 +75,7 @@ $tasks = [
 if (!isset($tasks[$task])) {
     finish(404, ['ok' => false]);
 }
-if (!is_dir($repo) || !is_file($node) || !is_file($tasks[$task]['command'][1])) {
+if (!is_dir($repo) || !is_file($node) || !is_file($tasks[$task]['script'])) {
     privateLog($logFile, ['at' => gmdate('c'), 'task' => $task, 'status' => 'missing-runtime']);
     finish(503, ['ok' => false, 'status' => 'runtime-unavailable']);
 }
