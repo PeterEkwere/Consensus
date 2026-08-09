@@ -89,6 +89,10 @@ const DEFAULT_STATE = {
   outcomeExpiryHours: 24,
   feeRatePerSide: DEFAULT_COSTS.feeRatePerSide,
   slippageRatePerSide: DEFAULT_COSTS.slippageRatePerSide,
+  // Short-lived scheduled invocations replace an unsupported permanent PM2
+  // process on shared hosting. These cursors make each invocation idempotent.
+  telegramOffset: 0,
+  lastScheduledScanAt: 0,
 };
 
 const MARKET_LABELS = {
@@ -101,6 +105,7 @@ state = migrateState(state);
 
 const dryRun = process.argv.includes("--dry-run");
 const sendTest = process.argv.includes("--send-test");
+const scheduledRun = process.argv.includes("--scheduled-run");
 
 // Assigned by main(). Left null when this file is required by a test so that
 // nothing polls Telegram and no token is needed.
@@ -1063,6 +1068,23 @@ function commandPattern(command) {
   return new RegExp(`\\/${command}(?:@\\w+)?(?:\\s+(.*))?$`, "i");
 }
 
+function parseTelegramCommand(text) {
+  const match = String(text || "").trim().match(/^\/([a-z0-9_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  return {
+    name: match[1].toLowerCase(),
+    argument: String(match[2] || "").trim(),
+  };
+}
+
+function scheduledScanDue(currentState, now = Date.now()) {
+  const intervalMs = Math.max(1, Number(currentState.scanIntervalMinutes || 5)) * 60 * 1000;
+  const last = Number(currentState.lastScheduledScanAt || 0);
+  if (!Number.isFinite(last) || last <= 0) return true;
+  if (!Number.isFinite(now) || now < last) return false;
+  return Math.floor(now / intervalMs) > Math.floor(last / intervalMs);
+}
+
 function helpText() {
   return `<b>${BOT_NAME}</b>\n\n` +
     `Clear crypto setup alerts using closed ${SETUP_TIMEFRAME_LABEL} candles from ${EXCHANGE}.\n\n` +
@@ -1283,6 +1305,103 @@ function registerCommands() {
   });
 }
 
+/**
+ * Scheduled invocations cannot leave Telegram long-polling in the background.
+ * Fetch the queued updates once and execute the small reader-facing command set
+ * directly, then persist the offset before the process exits.
+ */
+async function handleScheduledMessage(msg) {
+  const command = parseTelegramCommand(msg && msg.text);
+  if (!command || !msg.chat || !msg.from) return { forceScan: false, scanChatId: null };
+
+  const chatId = msg.chat.id;
+  const owner = isOwner(msg);
+  const ownerOnly = async (action) => {
+    if (!owner) {
+      await sendHtml(chatId, "Not authorized. This command is owner-only.");
+      return false;
+    }
+    await action();
+    return true;
+  };
+
+  if (command.name === "start" || command.name === "help") {
+    await sendHtml(chatId, helpText());
+  } else if (command.name === "id") {
+    await sendHtml(chatId,
+      `<b>Chat ID</b>\n\n` +
+      `Current chat: <code>${esc(chatId)}</code>\n` +
+      `Your user ID: <code>${esc(msg.from.id)}</code>\n\n` +
+      `Use /activate in the group to make this bot alert there.`
+    );
+  } else if (command.name === "activate") {
+    await ownerOnly(async () => {
+      if (!state.alertChatIds.includes(chatId)) state.alertChatIds.push(chatId);
+      saveJson(STATE_FILE, state);
+      await sendHtml(chatId, `<b>${BOT_NAME}</b>\n\nAlerts are now active in this chat.`);
+    });
+  } else if (command.name === "deactivate") {
+    await ownerOnly(async () => {
+      state.alertChatIds = state.alertChatIds.filter((id) => id !== chatId);
+      if (!state.alertChatIds.length) state.alertChatIds = [DEFAULT_OWNER_CHAT_ID];
+      saveJson(STATE_FILE, state);
+      await sendHtml(chatId, `<b>${BOT_NAME}</b>\n\nAlerts removed from this chat.`);
+    });
+  } else if (command.name === "status") {
+    await sendHtml(chatId, statusText());
+  } else if (command.name === "results") {
+    await ownerOnly(() => sendHtml(chatId, resultsText()));
+  } else if (command.name === "pause") {
+    await ownerOnly(async () => {
+      state.paused = true;
+      saveJson(STATE_FILE, state);
+      await sendHtml(chatId, `<b>${BOT_NAME}</b>\n\nAuto alerts paused.`);
+    });
+  } else if (command.name === "resume") {
+    await ownerOnly(async () => {
+      state.paused = false;
+      saveJson(STATE_FILE, state);
+      await sendHtml(chatId, `<b>${BOT_NAME}</b>\n\nAuto alerts resumed.`);
+    });
+  } else if (command.name === "pairs") {
+    await sendHtml(chatId, pairsText());
+  } else if (command.name === "scan") {
+    const accepted = await ownerOnly(() => sendHtml(
+      chatId,
+      `<b>${BOT_NAME}</b>\n\nManual scan started. This can take about 15-40 seconds.`,
+    ));
+    if (accepted) return { forceScan: true, scanChatId: chatId };
+  }
+
+  return { forceScan: false, scanChatId: null };
+}
+
+async function pollScheduledCommands() {
+  const updates = await bot.getUpdates({
+    offset: Math.max(0, Number(state.telegramOffset || 0)),
+    limit: 100,
+    timeout: 0,
+    allowed_updates: ["message"],
+  });
+  let forceScan = false;
+  const scanChatIds = new Set();
+  let processed = 0;
+
+  for (const update of Array.isArray(updates) ? updates : []) {
+    if (!Number.isFinite(update.update_id)) continue;
+    // At-most-once command handling. A crash may lose a response, but cannot
+    // replay a state-changing owner command on the next minute.
+    state.telegramOffset = Math.max(Number(state.telegramOffset || 0), update.update_id + 1);
+    saveJson(STATE_FILE, state);
+    if (!update.message) continue;
+    const result = await handleScheduledMessage(update.message);
+    processed += 1;
+    forceScan = forceScan || result.forceScan;
+    if (result.scanChatId !== null) scanChatIds.add(result.scanChatId);
+  }
+  return { forceScan, scanChatIds: [...scanChatIds], processed };
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -1327,11 +1446,68 @@ async function scanLoop() {
   }
 }
 
+async function scheduledMain() {
+  saveJson(STATE_FILE, state);
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error("Missing TELEGRAM_BOT_TOKEN. Set it in the private repo .env file.");
+  }
+
+  bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+  outcomes = createTracker();
+
+  let commands = { forceScan: false, scanChatIds: [], processed: 0 };
+  try {
+    commands = await pollScheduledCommands();
+  } catch (err) {
+    // Market scanning and outcome tracking must continue through a temporary
+    // Telegram getUpdates failure. Alert sends retain their own error handling.
+    console.error("Scheduled Telegram command check failed:", err.message);
+  }
+
+  let outcomeEvents = [];
+  try {
+    outcomeEvents = await outcomes.poll();
+  } catch (err) {
+    console.error("Scheduled outcome monitoring failed:", err.message);
+  }
+
+  const now = Date.now();
+  let scanSummary = null;
+  if (!state.paused && (commands.forceScan || scheduledScanDue(state, now))) {
+    scanSummary = await scanMarkets(false);
+    if (scanSummary.liveDataPairs <= 0) {
+      throw new Error("Scheduled scan received no live closed candles for any configured pair.");
+    }
+    state.lastScheduledScanAt = now;
+    saveJson(STATE_FILE, state);
+  }
+
+  if (commands.scanChatIds.length) {
+    const response = scanSummary
+      ? `<b>${BOT_NAME}</b>\n\nManual scan complete.\n` +
+        `Markets checked: <b>${scanSummary.liveDataPairs}</b>\n` +
+        `Candidates: <b>${scanSummary.candidates}</b>\n` +
+        `Fresh alerts: <b>${scanSummary.fresh}</b>`
+      : `<b>${BOT_NAME}</b>\n\nThe scanner is paused. Use /resume before requesting a scan.`;
+    for (const chatId of commands.scanChatIds) await sendHtml(chatId, response);
+  }
+
+  console.log(
+    `scheduled consensus run complete: commands=${commands.processed} ` +
+    `outcomeEvents=${outcomeEvents.length} scanned=${scanSummary ? scanSummary.liveDataPairs : 0}`,
+  );
+}
+
 async function main() {
   saveJson(STATE_FILE, state);
 
   if (dryRun) {
     await scanMarkets(false);
+    return;
+  }
+
+  if (scheduledRun) {
+    await scheduledMain();
     return;
   }
 
@@ -1385,6 +1561,9 @@ module.exports = {
   helpText,
   resultsText,
   sampleSignal,
+  parseTelegramCommand,
+  scheduledMain,
+  scheduledScanDue,
   signalButtons,
   topConfirmations,
 };

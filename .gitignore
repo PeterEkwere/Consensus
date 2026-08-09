@@ -4,6 +4,12 @@ signals.json
 state.json
 outcomes.json
 outcomes.json.tmp
+.cron-trigger-secret
+.cron-gateway-path
+.cron-job-ids.json
+.scheduler-*.lock
+.scheduler.log
+.scheduler.log.1
 .env.pre-*
 node_modules/
 npm-debug.log*

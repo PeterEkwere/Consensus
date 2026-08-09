@@ -119,6 +119,9 @@ CONFIG.liquidityProviderWallets = [...new Set([
 // chat id is configured.
 const TG_TOKEN = process.env.EDGE_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT = process.env.EDGE_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '';
+const HAS_DEDICATED_TELEGRAM = Boolean(
+  process.env.EDGE_TELEGRAM_BOT_TOKEN && process.env.EDGE_TELEGRAM_CHAT_ID,
+);
 
 /* ============================== UTILS ============================== */
 
@@ -607,11 +610,17 @@ function cohortPositionFlow(positions, snapshots, time, markPx, lookbacks, compl
 /* ============================== SCAN + CONFLUENCE ============================== */
 
 const liveFundingCache = {};
-async function liveFundingHistory(coin) {
-  const cached = liveFundingCache[coin];
+async function liveFundingHistory(coin, state) {
+  // A permanent process can keep this in memory. Shared-host scheduled runs
+  // exit after every scan, so persist the same short cache in the private state
+  // file instead of downloading a week of funding history every minute.
+  state.fundingHistoryCache = state.fundingHistoryCache || {};
+  const cached = state.fundingHistoryCache[coin] || liveFundingCache[coin];
   if (cached && nowMs() - cached.time < 55 * 60e3) return cached.rows;
   const rows = await hlFundingHistory(coin, nowMs() - (CONFIG.fundingZWindow + 2) * 3600e3);
-  liveFundingCache[coin] = { time: nowMs(), rows };
+  const value = { time: nowMs(), rows };
+  liveFundingCache[coin] = value;
+  state.fundingHistoryCache[coin] = value;
   return rows;
 }
 
@@ -645,7 +654,7 @@ async function scanOnce(state, { silent = false } = {}) {
     const m = market[coin];
     if (!m) continue;
 
-    const hist = await liveFundingHistory(coin);
+    const hist = await liveFundingHistory(coin, state);
     const wFund = fundingWitness(m.funding, hist.slice(0, -1)); // window excludes latest print
 
     const snaps = state.oiSnapshots[coin] || [];
@@ -764,8 +773,8 @@ async function tgSend(text) {
   await tgApi('sendMessage', { chat_id: TG_CHAT, text });
 }
 
-async function tgPollCommands(state, lastResults) {
-  const res = await tgApi('getUpdates', { offset: state.tgOffset, timeout: 25 });
+async function tgPollCommands(state, lastResults, timeout = 25) {
+  const res = await tgApi('getUpdates', { offset: state.tgOffset, timeout });
   for (const u of res.result || []) {
     state.tgOffset = u.update_id + 1;
     const text = (u.message && u.message.text || '').trim();
@@ -785,6 +794,34 @@ async function tgPollCommands(state, lastResults) {
 
 /* ============================== LIVE LOOP ============================== */
 
+async function processScanAlerts(state, results) {
+  for (const r of results) {
+    if (Math.abs(r.score) < CONFIG.alertScore) continue;
+    const key = `${r.coin}:${Math.sign(r.score)}`;
+    const last = state.lastAlerts[key] || 0;
+    if (nowMs() - last < CONFIG.alertCooldownMin * 60e3) continue;
+    state.lastAlerts[key] = nowMs();
+    saveState(state);
+    if (CONFIG.researchMode) {
+      console.log(`[research-mode, not sent] confluence ${r.coin} score ${r.score}`);
+      continue;
+    }
+    await tgSend(`⚡ CONFLUENCE ALERT\n\n${formatReport(r)}\n\nNot financial advice. Check the chart.`);
+  }
+}
+
+async function runScheduled() {
+  const state = loadState();
+  const results = await scanOnce(state);
+  await processScanAlerts(state, results);
+
+  // Never consume Consensus Reaper's updates through the send-only fallback
+  // token. Interactive Edge commands require their own bot and chat.
+  if (HAS_DEDICATED_TELEGRAM) await tgPollCommands(state, results, 0);
+  saveState(state);
+  console.log(`[${new Date().toISOString()}] scheduled edge research scan complete: ${results.length} coins`);
+}
+
 async function runLive() {
   const state = loadState();
   let lastResults = [];
@@ -797,24 +834,12 @@ async function runLive() {
     if (nowMs() >= nextScan) {
       try {
         lastResults = await scanOnce(state);
-        for (const r of lastResults) {
-          if (Math.abs(r.score) < CONFIG.alertScore) continue;
-          const key = `${r.coin}:${Math.sign(r.score)}`;
-          const last = state.lastAlerts[key] || 0;
-          if (nowMs() - last < CONFIG.alertCooldownMin * 60e3) continue;
-          state.lastAlerts[key] = nowMs();
-          saveState(state);
-          if (CONFIG.researchMode) {
-            console.log(`[research-mode, not sent] confluence ${r.coin} score ${r.score}`);
-            continue;
-          }
-          await tgSend(`⚡ CONFLUENCE ALERT\n\n${formatReport(r)}\n\nNot financial advice. Check the chart.`);
-        }
+        await processScanAlerts(state, lastResults);
         console.log(`[${new Date().toISOString()}] scanned ${lastResults.length} coins`);
       } catch (e) { console.error('scan error:', e.message); }
       nextScan = nowMs() + CONFIG.scanEveryMin * 60e3;
     }
-    if (TG_TOKEN && TG_CHAT) {
+    if (HAS_DEDICATED_TELEGRAM) {
       try { await tgPollCommands(state, lastResults); }
       catch (e) { console.error('telegram error:', e.message); await sleep(5000); }
     } else await sleep(30_000); // no Telegram configured: console-only mode
@@ -1635,6 +1660,7 @@ const [, , cmd, arg1, arg2] = process.argv;
     const results = await scanOnce(loadState(), { silent: false });
     console.log(results.map(formatReport).join('\n\n'));
   }
+  else if (cmd === 'scheduled-run') await runScheduled();
   else if (cmd === 'run') await runLive();
-  else console.log('Usage: node edge-bot.js [scan | run | backtest COIN|ALL DAYS | journal-status [FILE] | screen-wallets [ADDR,ADDR] | evaluate [FILE] | evaluate-scalps [FILE] [MINUTES] | selftest]');
+  else console.log('Usage: node edge-bot.js [scan | scheduled-run | run | backtest COIN|ALL DAYS | journal-status [FILE] | screen-wallets [ADDR,ADDR] | evaluate [FILE] | evaluate-scalps [FILE] [MINUTES] | selftest]');
 })().catch((e) => { console.error('fatal:', e.message); process.exit(1); });

@@ -16,8 +16,10 @@ const {
   formatOutcome,
   formatSignal,
   helpText,
+  parseTelegramCommand,
   resultsText,
   sampleSignal,
+  scheduledScanDue,
   signalButtons,
   topConfirmations,
 } = require("./bot");
@@ -66,6 +68,21 @@ function record(overrides = {}) {
 // ---------------------------------------------------------------------------
 
 section("entry alert");
+
+test("scheduled command parsing accepts group suffixes without treating prose as commands", () => {
+  assert.deepStrictEqual(parseTelegramCommand("/help@ConsensusBot"), { name: "help", argument: "" });
+  assert.deepStrictEqual(parseTelegramCommand(" /scan now "), { name: "scan", argument: "now" });
+  assert.strictEqual(parseTelegramCommand("please /scan"), null);
+});
+
+test("scheduled scan cadence is slot based and resists clock rollback", () => {
+  const fiveMinutes = 5 * 60 * 1000;
+  const slot = 100 * fiveMinutes;
+  assert.strictEqual(scheduledScanDue({ scanIntervalMinutes: 5, lastScheduledScanAt: 0 }, slot), true);
+  assert.strictEqual(scheduledScanDue({ scanIntervalMinutes: 5, lastScheduledScanAt: slot + 1000 }, slot + 2000), false);
+  assert.strictEqual(scheduledScanDue({ scanIntervalMinutes: 5, lastScheduledScanAt: slot + 1000 }, slot + fiveMinutes), true);
+  assert.strictEqual(scheduledScanDue({ scanIntervalMinutes: 5, lastScheduledScanAt: slot + 1000 }, slot), false);
+});
 
 test("the alert carries entry, stop, both targets and the alert id", () => {
   const signal = sampleSignal();
