@@ -8,6 +8,8 @@ outcomes.json.tmp
 .cron-gateway-path
 .cron-job-ids.json
 .scheduler-*.lock
+.scheduler-*.status
+.scheduler-*.status.tmp.*
 .scheduler.log
 .scheduler.log.1
 .env.pre-*

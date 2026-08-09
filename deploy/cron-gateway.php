@@ -24,34 +24,15 @@ function finish(int $status, array $body): never
     exit;
 }
 
-function privateLog(string $file, array $row): void
-{
-    if (is_file($file) && filesize($file) > 524288) {
-        @rename($file, $file . '.1');
-    }
-    $line = json_encode($row, JSON_UNESCAPED_SLASHES) . "\n";
-    @file_put_contents($file, $line, FILE_APPEND | LOCK_EX);
-    @chmod($file, 0600);
-}
-
-function cleanDiagnostic(string $value): string
-{
-    $value = preg_replace('/\b\d{6,12}:[A-Za-z0-9_-]{20,}\b/', '[redacted-token]', $value) ?? '';
-    $value = preg_replace('/Authorization:\s*[^\s]+/i', 'Authorization: [redacted]', $value) ?? '';
-    $value = preg_replace('/[\r\n\t]+/', ' ', $value) ?? '';
-    return substr(trim($value), -2000);
-}
-
 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     finish(404, ['ok' => false]);
 }
 
 // __DIR__ is <home>/domains/forefada.com/public_html/staging/public/<random>.
-$home = dirname(__DIR__, 6);
-$repo = $home . '/.consensus-reaper';
+$accountRoot = dirname(__DIR__, 6);
+$repo = $accountRoot . '/.consensus-reaper';
 $secretFile = $repo . '/.cron-trigger-secret';
-$logFile = $repo . '/.scheduler.log';
-$node = $home . '/.nvm/versions/node/v22.22.0/bin/node';
+$runner = $repo . '/deploy/scheduled-runner.sh';
 
 $secret = is_file($secretFile) ? trim((string) file_get_contents($secretFile)) : '';
 $provided = trim((string) ($_SERVER['HTTP_X_CONSENSUS_SCHEDULER'] ?? ''));
@@ -60,114 +41,49 @@ if (strlen($secret) < 32 || strlen($provided) < 32 || !hash_equals($secret, $pro
 }
 
 $task = (string) ($_GET['task'] ?? '');
-$tasks = [
-    'consensus' => [
-        'script' => $repo . '/bot.js',
-        'command' => [$node, '--max-old-space-size=96', $repo . '/bot.js', '--scheduled-run'],
-        'timeout' => 52,
-    ],
-    'edge' => [
-        'script' => $repo . '/edge-bot/edge-bot.js',
-        'command' => [$node, '--max-old-space-size=96', $repo . '/edge-bot/edge-bot.js', 'scheduled-run'],
-        'timeout' => 48,
-    ],
-];
-if (!isset($tasks[$task])) {
+if (!in_array($task, ['consensus', 'edge'], true)) {
     finish(404, ['ok' => false]);
 }
-if (!is_dir($repo) || !is_file($node) || !is_file($tasks[$task]['script'])) {
-    privateLog($logFile, ['at' => gmdate('c'), 'task' => $task, 'status' => 'missing-runtime']);
+if (!is_dir($repo) || !is_file($runner)) {
     finish(503, ['ok' => false, 'status' => 'runtime-unavailable']);
 }
 
-$lockPath = $repo . '/.scheduler-' . $task . '.lock';
-$lock = @fopen($lockPath, 'c+');
-if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-    if (is_resource($lock)) fclose($lock);
-    finish(202, ['ok' => true, 'status' => 'already-running']);
+$previousFailed = false;
+$statusFile = $repo . '/.scheduler-' . $task . '.status';
+if (is_file($statusFile)) {
+    $parts = preg_split('/\s+/', trim((string) file_get_contents($statusFile))) ?: [];
+    $previousState = (string) ($parts[0] ?? '');
+    $previousTime = (int) ($parts[1] ?? 0);
+    $previousFailed = $previousState === 'failed'
+        || ($previousState === 'running' && $previousTime > 0 && time() - $previousTime > 180);
 }
-@chmod($lockPath, 0600);
 
 $descriptors = [
-    0 => ['pipe', 'r'],
-    1 => ['pipe', 'w'],
-    2 => ['pipe', 'w'],
+    0 => ['file', '/dev/null', 'r'],
+    1 => ['file', '/dev/null', 'a'],
+    2 => ['file', '/dev/null', 'a'],
 ];
 $environment = [
-    'HOME' => $home,
-    'PATH' => dirname($node) . ':/usr/bin:/bin',
+    'PATH' => '/usr/bin:/bin',
     'NODE_ENV' => 'production',
     'LANG' => 'C.UTF-8',
 ];
 $options = ['bypass_shell' => true];
+$launchCommand = sprintf(
+    'nohup /bin/sh %s %s >/dev/null 2>&1 </dev/null &',
+    escapeshellarg($runner),
+    escapeshellarg($task),
+);
 $pipes = [];
-$started = microtime(true);
-$process = @proc_open($tasks[$task]['command'], $descriptors, $pipes, $repo, $environment, $options);
+$process = @proc_open(['/bin/sh', '-c', $launchCommand], $descriptors, $pipes, $repo, $environment, $options);
 if (!is_resource($process)) {
-    flock($lock, LOCK_UN);
-    fclose($lock);
-    privateLog($logFile, ['at' => gmdate('c'), 'task' => $task, 'status' => 'start-failed']);
     finish(503, ['ok' => false, 'status' => 'start-failed']);
 }
-
-fclose($pipes[0]);
-stream_set_blocking($pipes[1], false);
-stream_set_blocking($pipes[2], false);
-$stdout = '';
-$stderr = '';
-$exitCode = -1;
-$timedOut = false;
-$timeout = (int) $tasks[$task]['timeout'];
-
-while (true) {
-    $status = proc_get_status($process);
-    foreach ([1, 2] as $index) {
-        $chunk = stream_get_contents($pipes[$index]);
-        if ($chunk === false || $chunk === '') continue;
-        if ($index === 1) $stdout = substr($stdout . $chunk, -8192);
-        else $stderr = substr($stderr . $chunk, -8192);
-    }
-
-    if (!$status['running']) {
-        $exitCode = (int) $status['exitcode'];
-        break;
-    }
-    if (microtime(true) - $started > $timeout) {
-        $timedOut = true;
-        @proc_terminate($process);
-        usleep(250000);
-        $afterTerm = proc_get_status($process);
-        if ($afterTerm['running']) @proc_terminate($process, 9);
-        break;
-    }
-    usleep(50000);
+$launchCode = proc_close($process);
+if ($launchCode !== 0) {
+    finish(503, ['ok' => false, 'status' => 'start-failed']);
 }
-
-foreach ([1, 2] as $index) {
-    $chunk = stream_get_contents($pipes[$index]);
-    if ($chunk !== false && $chunk !== '') {
-        if ($index === 1) $stdout = substr($stdout . $chunk, -8192);
-        else $stderr = substr($stderr . $chunk, -8192);
-    }
-    fclose($pipes[$index]);
+if ($previousFailed) {
+    finish(500, ['ok' => false, 'status' => 'previous-run-failed']);
 }
-$closedCode = proc_close($process);
-if ($exitCode < 0 && $closedCode >= 0) $exitCode = $closedCode;
-$durationMs = (int) round((microtime(true) - $started) * 1000);
-
-flock($lock, LOCK_UN);
-fclose($lock);
-
-privateLog($logFile, [
-    'at' => gmdate('c'),
-    'task' => $task,
-    'status' => $timedOut ? 'timeout' : ($exitCode === 0 ? 'ok' : 'failed'),
-    'exitCode' => $exitCode,
-    'durationMs' => $durationMs,
-    'stdout' => cleanDiagnostic($stdout),
-    'stderr' => cleanDiagnostic($stderr),
-]);
-
-if ($timedOut) finish(504, ['ok' => false, 'status' => 'timeout', 'durationMs' => $durationMs]);
-if ($exitCode !== 0) finish(500, ['ok' => false, 'status' => 'failed', 'durationMs' => $durationMs]);
-finish(200, ['ok' => true, 'status' => 'complete', 'durationMs' => $durationMs]);
+finish(202, ['ok' => true, 'status' => 'accepted']);
