@@ -5,7 +5,7 @@ declare(strict_types=1);
  * Short-lived scheduler bridge for shared hosting.
  *
  * Deploy this file inside a randomly named directory directly below the
- * staging.forefada.com document root. It contains no credential. The request
+ * staging.forefada.com Laravel public directory. It contains no credential. The request
  * secret and every bot file remain in the private Consensus directory.
  */
 
@@ -46,8 +46,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
     finish(404, ['ok' => false]);
 }
 
-// __DIR__ is <home>/domains/forefada.com/public_html/staging/<random>.
-$home = dirname(__DIR__, 5);
+// __DIR__ is <home>/domains/forefada.com/public_html/staging/public/<random>.
+$home = dirname(__DIR__, 6);
 $repo = $home . '/.consensus-reaper';
 $secretFile = $repo . '/.cron-trigger-secret';
 $logFile = $repo . '/.scheduler.log';
