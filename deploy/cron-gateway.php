@@ -62,11 +62,11 @@ if (strlen($secret) < 32 || strlen($provided) < 32 || !hash_equals($secret, $pro
 $task = (string) ($_GET['task'] ?? '');
 $tasks = [
     'consensus' => [
-        'command' => [$node, $repo . '/bot.js', '--scheduled-run'],
+        'command' => [$node, '--max-old-space-size=96', $repo . '/bot.js', '--scheduled-run'],
         'timeout' => 52,
     ],
     'edge' => [
-        'command' => [$node, $repo . '/edge-bot/edge-bot.js', 'scheduled-run'],
+        'command' => [$node, '--max-old-space-size=96', $repo . '/edge-bot/edge-bot.js', 'scheduled-run'],
         'timeout' => 48,
     ],
 ];
