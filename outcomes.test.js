@@ -20,6 +20,7 @@ const {
   makeAlertId,
   sanitizeRecord,
   summarise,
+  summariseAllCohorts,
 } = require("./outcomes");
 
 const MINUTE = 60 * 1000;
@@ -247,6 +248,33 @@ test("a reached first target remains scored when only the final leg expires", ()
   assert.strictEqual(stats.threeR.resolved, 0, "the unresolved 3:1 leg stays excluded");
 });
 
+test("MFE, MAE and timings begin at entry and use only eligible chronology", () => {
+  const initial = recordFor(longSignal());
+  const beforeAlert = { time: ALERT_MS - MINUTE, low: 80, high: 140, open: 100, close: 100 };
+  const beforeEntry = candle(1, 101, 108);
+  const pending = run(initial, [beforeAlert, beforeEntry], ALERT_MS + MINUTE).record;
+  assert.strictEqual(pending.mfeR, null);
+  assert.strictEqual(pending.maeR, null);
+  const entered = run(initial, [beforeAlert, beforeEntry, candle(2, 98, 106)], ALERT_MS + 2 * MINUTE);
+
+  assert.strictEqual(entered.record.entryStatus, "entered");
+  assert.strictEqual(entered.record.msToEntry, 2 * MINUTE);
+  assert.strictEqual(entered.record.mfeR, null, "entry-candle ordering is unknowable from OHLC");
+  assert.strictEqual(entered.record.maeR, null);
+
+  const first = run(entered.record, [candle(3, 95, 112)], ALERT_MS + 3 * MINUTE);
+  assert.strictEqual(first.record.r1Status, "tp");
+  assert.strictEqual(first.record.msToFirstTarget, MINUTE);
+  assert(Math.abs(first.record.mfeR - 1.2) < 1e-9);
+  assert(Math.abs(first.record.maeR - 0.5) < 1e-9);
+
+  const final = run(first.record, [candle(4, 97, 131)], ALERT_MS + 4 * MINUTE);
+  assert.strictEqual(final.record.r3Status, "tp");
+  assert.strictEqual(final.record.msToFinalResolution, 2 * MINUTE);
+  assert(Math.abs(final.record.mfeR - 3.1) < 1e-9);
+  assert(Math.abs(final.record.maeR - 0.5) < 1e-9);
+});
+
 test("a setup resolved just before expiry keeps its result", () => {
   const result = run(recordFor(longSignal()), [candle(1, 99, 131)], ALERT_MS + EXPIRY_MS + MINUTE);
   assert.strictEqual(result.record.status, "complete");
@@ -267,6 +295,19 @@ test("expectancy is net of the configured costs", () => {
   assert.strictEqual(stats.oneR.grossExpectancyR, 1);
   assert(Math.abs(stats.oneR.netExpectancyR - 0.98) < 1e-9, `got ${stats.oneR.netExpectancyR}`);
   assert(Math.abs(stats.threeR.netExpectancyR - 2.98) < 1e-9, `got ${stats.threeR.netExpectancyR}`);
+  const observedWin = run(recordFor(longSignal({ execution: { costR: 0.07, known: true } })), [candle(1, 99, 131)]).record;
+  const observed = summarise([observedWin]);
+  assert(Math.abs(observed.oneR.netExpectancyR - 0.93) < 1e-9, `got ${observed.oneR.netExpectancyR}`);
+  assert(Math.abs(observed.oneRStats.netExpectancyR - 0.93) < 1e-9);
+});
+
+test("all-cohort summaries keep their actual labels", () => {
+  const a = recordFor(longSignal({ cohortId: "cohort-a" }), "CR-A-001");
+  const b = recordFor(longSignal({ cohortId: "cohort-b", symbol: "ETHUSDT" }), "CR-B-001");
+  const legacy = recordFor(longSignal({ cohortId: null, symbol: "SOLUSDT" }), "CR-L-001");
+  const rows = summariseAllCohorts([a, b, legacy]);
+  assert.deepStrictEqual(rows.map((row) => row.cohortId), ["cohort-a", "cohort-b", "legacy-unknown"]);
+  assert(rows.every((row) => row.total === 1));
 });
 
 test("win rate and t-statistic need enough data", () => {
@@ -429,7 +470,7 @@ test("a candle fetch failure never fabricates an outcome", async () => {
   });
 });
 
-test("malformed persisted records are dropped, not crashed on", () => {
+test("malformed persisted records fail closed before they can be overwritten", () => {
   return withTracker((file) => {
     const good = recordFor(longSignal());
     fs.writeFileSync(file, JSON.stringify([
@@ -444,18 +485,19 @@ test("malformed persisted records are dropped, not crashed on", () => {
       { id: "CR-X-3", symbol: "BTCUSDT", side: "banana", entry: 100, stop: 90, tp1: 110, tp3: 130, r: 10 },
       { id: "CR-X-4", symbol: "BTCUSDT", side: "long", entry: 100, stop: 90, tp1: 111, tp3: 130, r: 10 },
     ]));
-    const tracker = createOutcomeTracker({ file, fetchCandles: async () => [], logger: quietLogger });
-    assert.strictEqual(tracker.records.length, 1);
-    assert.strictEqual(tracker.records[0].id, good.id);
+    assert.throws(
+      () => createOutcomeTracker({ file, fetchCandles: async () => [], logger: quietLogger }),
+      /malformed record/,
+    );
   });
 });
 
-test("a corrupt or non-array ledger starts empty instead of throwing", () => {
+test("a corrupt or non-array ledger fails closed while a missing ledger starts empty", () => {
   return withTracker((file) => {
     fs.writeFileSync(file, "{ this is not json");
-    assert.deepStrictEqual(loadRecords(file, quietLogger), []);
+    assert.throws(() => loadRecords(file, quietLogger), /not valid JSON/);
     fs.writeFileSync(file, JSON.stringify({ not: "an array" }));
-    assert.deepStrictEqual(loadRecords(file, quietLogger), []);
+    assert.throws(() => loadRecords(file, quietLogger), /did not contain an array/);
     assert.deepStrictEqual(loadRecords(path.join(path.dirname(file), "missing.json"), quietLogger), []);
   });
 });

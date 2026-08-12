@@ -1,0 +1,16 @@
+{
+  "name": "consensus-fx-sentinel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Alert-only FX setup finder and outcome-measurement bot. Research mode by default.",
+  "main": "runtime/bot.js",
+  "scripts": {
+    "test": "node --test runtime/tests/*.test.js",
+    "check": "node --check runtime/bot.js",
+    "dry": "node runtime/bot.js --dry-run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED"
+}

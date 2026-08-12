@@ -26,9 +26,7 @@ class ExitFill:
 
 def entry_is_touched(candle: Candle, signal: Signal) -> bool:
     """True when the retest entry price is touched by this candle."""
-    if signal.direction == "long":
-        return candle.low <= signal.entry
-    return candle.high >= signal.entry
+    return candle.low <= signal.entry <= candle.high
 
 
 def simulate_entry_fill(candle: Candle, signal: Signal, symbol_meta, cost_cfg: CostConfig) -> EntryFill:

@@ -4,11 +4,21 @@ For each closed LTF candle:
   - expose LTF candles up to now only,
   - expose HTF candles closed at or before now only,
   - advance the setup state machine (the same ``find_setup`` the live bot uses),
-  - on an entry signal, fill the retest and open a trade,
+  - on an entry signal, QUEUE it; the earliest candle that may fill it is the
+    next one,
   - manage the open trade candle-by-candle until stop/target.
 
-Position sizing risks a fixed fraction of the *current* balance per trade, so the
-sequence of trades is realistic for prop-rule simulation.
+Entry timing: ``find_setup`` can only return a signal once candle ``i`` has
+closed, so filling inside candle ``i`` would use information that did not exist
+at decision time. Queued signals are filled on a later candle, and only when that
+candle actually trades through the entry price. A candle that reaches the stop
+without touching the entry cancels the setup before entry.
+
+Known limitation, unchanged by that repair: position sizing here risks a fixed
+fraction of ``initial_balance`` rather than the running balance, and portfolio
+concurrency is applied after the fact in ``replay_portfolio``. The resulting
+equity path is therefore NOT a faithful sequential simulation. See
+``FX_BOT/README.md``.
 """
 from __future__ import annotations
 
@@ -17,7 +27,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from backtest.costs import CostConfig, commission_cost_usd
-from backtest.fill_model import EntryFill, simulate_entry_fill, simulate_exit_on_candle
+from backtest.fill_model import (
+    EntryFill,
+    entry_is_touched,
+    simulate_entry_fill,
+    simulate_exit_on_candle,
+)
 from domain.models import Candle, Signal, Trade
 from domain.series import CandleSeries, as_series
 from domain.time_utils import ensure_utc, timeframe_minutes
@@ -83,6 +98,23 @@ class _OpenTrade:
     bars_held: int = 0
 
 
+@dataclass
+class _PendingSignal:
+    """A signal awaiting its first eligible entry candle.
+
+    Created when candle ``i`` closes; only candles after ``i`` may fill it.
+    """
+    signal: Signal
+    bars_waited: int = 0
+
+
+def _stop_reached(candle: Candle, signal: Signal) -> bool:
+    """True when this candle trades at or beyond the signal's stop."""
+    if signal.direction == "long":
+        return candle.low <= signal.stop
+    return candle.high >= signal.stop
+
+
 def _close_trade(ot: _OpenTrade, exit_price: float, exit_time: datetime, reason: str,
                  symbol_meta, cost_cfg: CostConfig, trade_id: str) -> Trade:
     pip = symbol_meta.pip_size
@@ -144,8 +176,10 @@ def replay_symbol(
 
     state = initial_state(symbol)
     open_trade: _OpenTrade | None = None
+    pending: _PendingSignal | None = None
     trades: list[Trade] = []
     signal_count = 0
+    max_wait_bars = getattr(strategy_cfg, "max_setup_age_bars", 12)
 
     for i in range(len(ltf)):
         candle = ltf[i]
@@ -167,30 +201,57 @@ def replay_symbol(
                     symbol_meta, cost_cfg, f"{symbol}-{len(trades)}"))
                 open_trade = None
 
+        # 2) Try to fill a signal queued by an EARLIER candle. This runs before
+        #    detection below, so a signal created on this candle can never be
+        #    filled by this candle.
+        if pending is not None and open_trade is None:
+            pending.bars_waited += 1
+            signal = pending.signal
+            if entry_is_touched(candle, signal):
+                fill = simulate_entry_fill(candle, signal, symbol_meta, cost_cfg)
+                lots = _size_position(
+                    signal, replay_cfg.initial_balance, replay_cfg.risk_pct, symbol_meta, fill)
+                if lots > 0:
+                    open_trade = _OpenTrade(
+                        signal=signal, symbol=symbol, direction=signal.direction,
+                        entry_price=fill.price, entry_time=candle.time,
+                        stop_price=signal.stop, target_price=signal.target,
+                        lots=lots, risk_amount=replay_cfg.risk_pct * replay_cfg.initial_balance,
+                    )
+                    # Entry and exit levels can occur in the same bar. Once the
+                    # entry is genuinely inside this candle, evaluate that bar
+                    # immediately; the existing stop-first ambiguity rule is
+                    # intentionally preserved.
+                    exit_fill = simulate_exit_on_candle(
+                        candle, open_trade, symbol_meta, cost_cfg)
+                    if exit_fill is not None:
+                        trades.append(_close_trade(
+                            open_trade, exit_fill.price, candle.time, exit_fill.reason,
+                            symbol_meta, cost_cfg, f"{symbol}-{len(trades)}"))
+                        open_trade = None
+                pending = None
+            elif _stop_reached(candle, signal):
+                # Invalidated before entry: the stop traded and the entry never
+                # did, so this setup can no longer be taken.
+                pending = None
+            elif pending.bars_waited >= max_wait_bars:
+                pending = None
+
         # Advance the monotonic HTF pointer to all HTF bars closed by now.
         while hj < n_htf and (
             ensure_utc(htf_candles_seq[hj].time) + timedelta(minutes=htf_min) <= decision_time
         ):
             hj += 1
 
-        # 2) Look for a new setup only when flat (one trade per symbol).
+        # 3) Look for a new setup only when flat (one trade per symbol).
         if open_trade is None or not replay_cfg.one_trade_per_symbol:
             lo = max(0, i + 1 - _LTF_WINDOW)
             ltf_view = ltf[lo: i + 1]
             htf_view = CandleSeries(htf_candles_seq[max(0, hj - _HTF_WINDOW): hj])
             state, signal = find_setup(state, ltf_view, htf_view, strategy_cfg, symbol_meta)
-            if signal is not None and open_trade is None:
+            if signal is not None and open_trade is None and pending is None:
                 signal_count += 1
-                fill = simulate_entry_fill(candle, signal, symbol_meta, cost_cfg)
-                lots = _size_position(signal, replay_cfg.initial_balance, replay_cfg.risk_pct, symbol_meta, fill)
-                if lots > 0:
-                    risk_amount = replay_cfg.risk_pct * replay_cfg.initial_balance
-                    open_trade = _OpenTrade(
-                        signal=signal, symbol=symbol, direction=signal.direction,
-                        entry_price=fill.price, entry_time=candle.time,
-                        stop_price=signal.stop, target_price=signal.target,
-                        lots=lots, risk_amount=risk_amount,
-                    )
+                pending = _PendingSignal(signal=signal)
     return trades, signal_count
 
 

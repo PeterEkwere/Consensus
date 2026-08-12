@@ -28,6 +28,8 @@
 "use strict";
 
 const fs = require("fs");
+const { LEGACY_COHORT_ID } = require("./strategy");
+const { legStatistics } = require("./stats");
 
 const DEFAULT_EXPIRY_HOURS = 24;
 const DEFAULT_MAX_RECORDS = 1000;
@@ -149,6 +151,24 @@ function createRecord(options) {
     side: plan.side,
     timeframe: signal.timeframe || "15m",
 
+    // --- Cohort identity -------------------------------------------------
+    // Persisted so a result can always be traced to the exact configuration
+    // that published it. A record without these belongs to the legacy cohort
+    // and is never blended with a known one.
+    strategyVersion: signal.strategyVersion || null,
+    strategyHash: signal.strategyHash || null,
+    cohortId: signal.cohortId || null,
+    thresholdAtAlert: Number.isFinite(signal.thresholdAtAlert) ? signal.thresholdAtAlert : null,
+    universeHash: signal.universeHash || null,
+    clusterId: signal.clusterId || null,
+    thesisKey: signal.thesisKey || null,
+    score: Number.isFinite(signal.score) ? signal.score : null,
+    scoreBin: signal.scoreBin || null,
+    familyCount: Number.isFinite(signal.familyCount) ? signal.familyCount : null,
+    regime: signal.regime || null,
+    context: signal.context || null,
+    execution: signal.execution || null,
+
     signalTime: signal.time,
     sentAt,
     watchFromMs: Number.isFinite(sentMs) ? sentMs : Date.now(),
@@ -188,6 +208,16 @@ function createRecord(options) {
     lastCandleTime: null,
     candlesSeen: 0,
     dataGaps: 0,
+
+    // --- Excursion and timing evidence ------------------------------------
+    // MFE/MAE are measured in R from the canonical entry, using only candles
+    // that were already eligible. Before entry both stay null: a setup that was
+    // never entered has no excursion, and inventing one would be look-ahead.
+    mfeR: null,
+    maeR: null,
+    msToEntry: null,
+    msToFirstTarget: null,
+    msToFinalResolution: null,
   };
 }
 
@@ -197,6 +227,12 @@ function oneOf(value, allowed, fallback) {
 
 function nearlyEqual(a, b) {
   return Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b));
+}
+
+function finiteOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 /**
@@ -255,6 +291,18 @@ function sanitizeRecord(row) {
     lastCandleTime: Number.isFinite(Number(row.lastCandleTime)) ? Number(row.lastCandleTime) : null,
     candlesSeen: Number(row.candlesSeen) || 0,
     dataGaps: Number(row.dataGaps) || 0,
+    // Absent on legacy rows. Left null rather than defaulted, so an unknown
+    // configuration is never made to look known.
+    cohortId: typeof row.cohortId === "string" && row.cohortId ? row.cohortId : null,
+    clusterId: typeof row.clusterId === "string" && row.clusterId ? row.clusterId : null,
+    thesisKey: typeof row.thesisKey === "string" && row.thesisKey ? row.thesisKey : null,
+    thresholdAtAlert: finiteOrNull(row.thresholdAtAlert),
+    familyCount: finiteOrNull(row.familyCount),
+    mfeR: finiteOrNull(row.mfeR),
+    maeR: finiteOrNull(row.maeR),
+    msToEntry: finiteOrNull(row.msToEntry),
+    msToFirstTarget: finiteOrNull(row.msToFirstTarget),
+    msToFinalResolution: finiteOrNull(row.msToFinalResolution),
   };
 }
 
@@ -272,6 +320,38 @@ function hitsStop(record, candle) {
 
 function hitsTarget(record, candle, target) {
   return record.side === "long" ? candle.high >= target : candle.low <= target;
+}
+
+/**
+ * Update maximum favourable and adverse excursion, in R from the entry.
+ *
+ * Only called for candles at or after entry activation, and only for candles
+ * that already passed the eligibility filter, so this can never see price
+ * action the setup's reader could not have traded. Before entry both values
+ * stay null rather than 0: "not entered" and "went nowhere" are different facts.
+ */
+function trackExcursion(record, candle) {
+  if (!(record.r > 0)) return;
+  const favourable = record.side === "long"
+    ? candle.high - record.entry
+    : record.entry - candle.low;
+  const adverse = record.side === "long"
+    ? record.entry - candle.low
+    : candle.high - record.entry;
+
+  const mfe = favourable / record.r;
+  const mae = adverse / record.r;
+  if (Number.isFinite(mfe)) {
+    record.mfeR = record.mfeR === null ? mfe : Math.max(record.mfeR, mfe);
+  }
+  if (Number.isFinite(mae)) {
+    record.maeR = record.maeR === null ? mae : Math.max(record.maeR, mae);
+  }
+}
+
+function elapsedFrom(record, isoOrMs) {
+  const at = typeof isoOrMs === "number" ? isoOrMs : Date.parse(isoOrMs);
+  return Number.isFinite(at) ? at - record.watchFromMs : null;
 }
 
 /**
@@ -303,11 +383,14 @@ function applyCandles(record, candles, options = {}) {
   for (const candle of usable) {
     next.lastCandleTime = candle.time;
     next.candlesSeen += 1;
+    let enteredThisCandle = false;
 
     if (next.entryStatus === "pending") {
       if (touches(candle, next.entry)) {
         next.entryStatus = "entered";
         next.entryTime = new Date(candle.time).toISOString();
+        next.msToEntry = elapsedFrom(next, candle.time);
+        enteredThisCandle = true;
       } else if (hitsStop(next, candle)) {
         // Price reached invalidation without ever trading the exact entry.
         next.entryStatus = "cancelled";
@@ -322,6 +405,11 @@ function applyCandles(record, candles, options = {}) {
     }
 
     const at = new Date(candle.time).toISOString();
+    // Excursion is only meaningful once the position exists.
+    // OHLC does not reveal whether the candle's high/low occurred before or
+    // after entry. Resolution remains stop-first, but excursion research starts
+    // with the next candle so it cannot claim unknowable favourable movement.
+    if (!enteredThisCandle) trackExcursion(next, candle);
     const stopped = hitsStop(next, candle);
 
     if (next.r1Status === "open") {
@@ -382,6 +470,16 @@ function applyCandles(record, candles, options = {}) {
     if (next.r3Status === "open") next.r3Status = "void";
   }
 
+  // Timings are derived once, from the timestamps the state machine already
+  // recorded, rather than being set in each of the resolution branches.
+  const entryMs = next.entryTime ? Date.parse(next.entryTime) : null;
+  if (Number.isFinite(entryMs)) {
+    const firstAt = next.r1ResolvedAt ? Date.parse(next.r1ResolvedAt) : null;
+    const finalAt = next.finalisedAt ? Date.parse(next.finalisedAt) : null;
+    if (Number.isFinite(firstAt)) next.msToFirstTarget = firstAt - entryMs;
+    if (Number.isFinite(finalAt)) next.msToFinalResolution = finalAt - entryMs;
+  }
+
   return { record: next, events: dedupeEvents(next, events) };
 }
 
@@ -415,6 +513,12 @@ function dedupeEvents(record, events) {
 
 /** Round-trip cost expressed in R, using the configured fee/slippage. */
 function costInR(record) {
+  // New records carry the publication-time execution snapshot, whose costR
+  // includes the observed spread as well as configured fees and slippage.
+  // Legacy rows have no snapshot, so retain the old deterministic fallback.
+  const rawObserved = record.execution && record.execution.costR;
+  const observed = rawObserved === null || rawObserved === undefined ? null : Number(rawObserved);
+  if (observed !== null && Number.isFinite(observed) && observed >= 0) return observed;
   const fee = Number(record.costs && record.costs.feeRatePerSide) || 0;
   const slip = Number(record.costs && record.costs.slippageRatePerSide) || 0;
   const perSide = fee + slip;
@@ -471,8 +575,62 @@ function legSummary(records, statusField, multiple) {
   };
 }
 
+/**
+ * Net-R samples for one leg, carrying the cluster each row belongs to so that
+ * correlated alerts can be collapsed before any inference is done.
+ */
+function legSamples(records, statusField, multiple) {
+  const out = [];
+  for (const record of records) {
+    const status = record[statusField];
+    if (status !== "tp" && status !== "sl") continue;
+    const gross = status === "tp" ? multiple : -1;
+    out.push({
+      clusterId: record.clusterId || null,
+      win: status === "tp",
+      gross,
+      net: gross - costInR(record),
+    });
+  }
+  return out;
+}
+
+/** Split records by cohort, keeping unknown configurations separate. */
+function byCohort(records) {
+  const groups = new Map();
+  for (const record of records || []) {
+    const id = record && record.cohortId ? record.cohortId : LEGACY_COHORT_ID;
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(record);
+  }
+  return groups;
+}
+
+/** Deterministic score-bin breakdown for the detailed owner-only view. */
+function scoreBinSummary(records) {
+  const bins = {};
+  for (const record of records) {
+    const bin = record.scoreBin || "unknown";
+    if (!bins[bin]) bins[bin] = { bin, total: 0, oneR: null, threeR: null, rows: [] };
+    bins[bin].total += 1;
+    bins[bin].rows.push(record);
+  }
+  for (const bin of Object.values(bins)) {
+    bin.oneR = legStatistics(legSamples(bin.rows, "r1Status", 1));
+    bin.threeR = legStatistics(legSamples(bin.rows, "r3Status", 3));
+    delete bin.rows;
+  }
+  return bins;
+}
+
 function summarise(records, options = {}) {
-  const rows = Array.isArray(records) ? records : [];
+  const all = Array.isArray(records) ? records : [];
+  // Default to the active cohort only. Blending configurations silently is the
+  // mistake this whole change exists to prevent.
+  const cohortFilter = options.cohortId || null;
+  const rows = cohortFilter
+    ? all.filter((r) => (r.cohortId || LEGACY_COHORT_ID) === cohortFilter)
+    : all;
   const sent = rows.filter((r) => r && r.sentAt);
   const times = sent.map((r) => Date.parse(r.sentAt)).filter(Number.isFinite).sort((a, b) => a - b);
 
@@ -508,7 +666,29 @@ function summarise(records, options = {}) {
     oneR: legSummary(rows, "r1Status", 1),
     threeR: legSummary(rows, "r3Status", 3),
     costs: options.costs || DEFAULT_COSTS,
+
+    // --- Honest sample size ------------------------------------------------
+    // Raw rows describe activity; clusters describe independent evidence.
+    // Inference must only ever use the cluster figures.
+    cohortId: cohortFilter,
+    clusters: new Set(rows.map((r) => r.clusterId).filter(Boolean)).size,
+    oneRStats: legStatistics(legSamples(rows, "r1Status", 1)),
+    threeRStats: legStatistics(legSamples(rows, "r3Status", 3)),
+    cohorts: [...byCohort(all).keys()],
+    legacyCount: all.filter((r) => !r.cohortId).length,
+    scoreBins: scoreBinSummary(rows),
   };
+}
+
+/** Per-cohort report for the explicit owner-only historical view. */
+function summariseAllCohorts(records, options = {}) {
+  const out = [];
+  for (const [id, rows] of byCohort(records)) {
+    // Apply the label after summarise(): its unfiltered form intentionally
+    // reports cohortId=null and must not overwrite the group we just selected.
+    out.push({ ...summarise(rows, { ...options, cohortId: null }), cohortId: id });
+  }
+  return out.sort((a, b) => String(a.cohortId).localeCompare(String(b.cohortId)));
 }
 
 // ---------------------------------------------------------------------------
@@ -519,29 +699,24 @@ function loadRecords(file, logger) {
   let raw;
   try {
     raw = fs.readFileSync(file, "utf8");
-  } catch {
-    return [];
+  } catch (err) {
+    if (err && err.code === "ENOENT") return [];
+    throw new Error(`outcomes: could not read ${file}`);
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
-  } catch (err) {
-    logger.error(`outcomes: ${file} is not valid JSON (${err.message}). Continuing with an empty ledger.`);
-    return [];
+  } catch {
+    throw new Error(`outcomes: ${file} is not valid JSON`);
   }
   if (!Array.isArray(parsed)) {
-    logger.error(`outcomes: ${file} did not contain an array. Continuing with an empty ledger.`);
-    return [];
+    throw new Error(`outcomes: ${file} did not contain an array`);
   }
   const clean = [];
-  let dropped = 0;
   for (const row of parsed) {
     const record = sanitizeRecord(row);
     if (record) clean.push(record);
-    else dropped += 1;
-  }
-  if (dropped) {
-    logger.error(`outcomes: ignored ${dropped} malformed record(s) in ${file}.`);
+    else throw new Error(`outcomes: ${file} contains a malformed record`);
   }
   return clean;
 }
@@ -549,8 +724,15 @@ function loadRecords(file, logger) {
 /** Atomic write: a torn file would take the whole trial down with it. */
 function saveRecords(file, records) {
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(records, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(records, null, 2), { mode: 0o600 });
+  const fd = fs.openSync(tmp, "r");
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
 }
 
 function createOutcomeTracker(options = {}) {
@@ -682,8 +864,21 @@ function createOutcomeTracker(options = {}) {
     get records() {
       return records;
     },
-    summary(now = Date.now()) {
-      return { ...summarise(records, { costs }), now, expiryHours };
+    /**
+     * Defaults to every record. Pass `{ cohortId }` to scope the report to one
+     * configuration, which is what `/results` does so it never blends settings.
+     */
+    summary(options = {}) {
+      const opts = typeof options === "number" ? {} : options;
+      return {
+        ...summarise(records, { costs, ...opts }),
+        now: Date.now(),
+        expiryHours,
+      };
+    },
+    /** Every cohort, reported separately and always labelled. */
+    summaryAllCohorts() {
+      return summariseAllCohorts(records, { costs });
     },
     costs,
     expiryHours,
@@ -701,8 +896,12 @@ module.exports = {
   dedupeKey,
   loadRecords,
   makeAlertId,
+  byCohort,
+  legSamples,
   sanitizeRecord,
   saveRecords,
+  scoreBinSummary,
   summarise,
+  summariseAllCohorts,
   tStat,
 };

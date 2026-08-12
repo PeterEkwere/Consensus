@@ -4,6 +4,9 @@ signals.json
 state.json
 outcomes.json
 outcomes.json.tmp
+# Withheld-setup research ledger. Runtime state, never tracked.
+shadow-outcomes.json
+shadow-outcomes.json.*.tmp
 .cron-trigger-secret
 .cron-gateway-path
 .cron-job-ids.json

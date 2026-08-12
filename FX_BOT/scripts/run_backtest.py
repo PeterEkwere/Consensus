@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """Run one backtest and write a report.
 
+LEGACY RESEARCH TOOL. This replay has NOT demonstrated a profitable strategy.
+Its known real January-June 2025 run produced roughly 1,225 trades, a 34% win
+rate, -0.309 average R, a 0.58 profit factor and zero passes across 25
+walk-forward runs. Reports produced here are research artefacts, not evidence
+of an edge.
+
+Known limitations that remain in this tool:
+  - position sizing risks a fraction of the INITIAL balance, not the running
+    balance, so the equity path is not a faithful sequential simulation;
+  - portfolio concurrency is applied after per-symbol replay rather than during
+    it;
+  - the prop-challenge simulator runs with an empty news calendar;
+  - several documented trend/session/momentum/quality filters are not wired
+    into the setup decision.
+
 Example:
     python scripts/run_backtest.py --data data_cache/raw/mt5 \
       --symbols EURUSD GBPUSD USDJPY XAUUSD --ltf M5 --htf M15 \
       --start 2025-01-01 --end 2025-06-30 \
-      --account-model fundingpips_2_step_phase_1 --strategy-profile synthetic \
+      --account-model fundingpips_2_step_phase_1 \
       --risk-pct 0.005 --cost-multiplier 1.0
 """
 import _bootstrap  # noqa: F401
@@ -27,8 +42,34 @@ def _date(s: str) -> datetime:
     return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
 
 
+SYNTHETIC_WARNING = (
+    "\n"
+    "!!! ==================================================================== !!!\n"
+    "!!! SYNTHETIC STRATEGY PROFILE SELECTED                                  !!!\n"
+    "!!!                                                                      !!!\n"
+    "!!! This profile is tuned for the generated demo candles in              !!!\n"
+    "!!! data/synthetic.py. Results produced with it measure plumbing only.   !!!\n"
+    "!!! They are NOT market evidence and must never be reported as           !!!\n"
+    "!!! profitability, an edge, or a reason to enable live alerts.           !!!\n"
+    "!!! ==================================================================== !!!\n"
+)
+
+
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "Legacy FX backtest replay. This strategy has NOT demonstrated an "
+            "edge (34% wins, -0.309 avg R, 0.58 profit factor over Jan-Jun 2025, "
+            "0/25 walk-forward passes). Output is research only."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Sizing uses the initial balance rather than the running balance and "
+            "portfolio concurrency is applied after replay, so the equity curve is "
+            "not a faithful sequential simulation. --strategy-profile synthetic "
+            "measures plumbing only and prints a warning."
+        ),
+    )
     ap.add_argument("--data", default="data_cache/raw/mt5")
     ap.add_argument("--symbols", nargs="+", default=["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
     ap.add_argument("--ltf", default="M5")
@@ -36,7 +77,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--start", type=_date, default=_date("2025-01-01"))
     ap.add_argument("--end", type=_date, default=_date("2025-06-30"))
     ap.add_argument("--account-model", default="fundingpips_2_step_phase_1")
-    ap.add_argument("--strategy-profile", default="synthetic")
+    # Synthetic execution must be an explicit, loudly-flagged choice.
+    ap.add_argument("--strategy-profile", default="default",
+                    help="strategy profile name (default: default). 'synthetic' is "
+                         "tuned for generated demo candles and proves plumbing only.")
     ap.add_argument("--initial-balance", type=float, default=100_000.0)
     ap.add_argument("--risk-pct", type=float, default=0.005)
     ap.add_argument("--cost-multiplier", type=float, default=1.0)
@@ -45,6 +89,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(args) -> int:
+    if args.strategy_profile == "synthetic":
+        print(SYNTHETIC_WARNING)
     rules = get_prop_rules(args.account_model)
     strategy = get_strategy(args.strategy_profile)
     strategy = type(strategy)(**{**strategy.__dict__, "ltf": args.ltf, "htf": args.htf})

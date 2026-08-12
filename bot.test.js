@@ -12,7 +12,9 @@ const os = require("os");
 const path = require("path");
 
 const {
+  activeCohortId,
   analyzePair,
+  broadcastSignal,
   formatOutcome,
   formatSignal,
   helpText,
@@ -20,6 +22,7 @@ const {
   resultsText,
   sampleSignal,
   scheduledScanDue,
+  selectPublishableCandidates,
   signalButtons,
   topConfirmations,
 } = require("./bot");
@@ -207,6 +210,98 @@ test("a generated signal carries levels consistent with its own risk", () => {
   assert.strictEqual(plan.tp3, signal.tp3);
 });
 
+test("scan selection shadows gate failures and publishes only the best measured cluster member", async () => {
+  const base = {
+    ...sampleSignal(),
+    familyCount: 4,
+    clusterId: "same-event",
+    thesisKey: "thesis-a",
+    score: 80,
+    costR: 0.2,
+  };
+  const lowerCost = {
+    ...base,
+    symbol: "ETHUSDT",
+    name: "ETH / USDT",
+    thesisKey: "thesis-b",
+    costR: 0.1,
+  };
+  const tooFewFamilies = {
+    ...base,
+    symbol: "SOLUSDT",
+    name: "SOL / USDT",
+    clusterId: "other-event",
+    thesisKey: "thesis-c",
+    familyCount: 2,
+  };
+  const selection = await selectPublishableCandidates(
+    [base, lowerCost, tooFewFamilies],
+    { benchmarkDirection: "mixed", benchmarkTrendH1: "mixed", breadthDirection: "mixed" },
+    {
+      threshold: 0,
+      isCoolingDown: () => false,
+      hasOpenThesis: () => false,
+      prepareSignalExecution: async (signal) => ({
+        ok: true,
+        plan: buildTradePlan(signal),
+        snapshot: { known: true, costR: signal.costR },
+      }),
+    },
+  );
+
+  assert.strictEqual(selection.accepted.length, 2);
+  assert.strictEqual(selection.fresh.length, 1);
+  assert.strictEqual(selection.fresh[0].signal.symbol, "ETHUSDT", "measured lower cost wins the tie");
+  assert(selection.withheld.some((row) => row.signal.symbol === "SOLUSDT"
+    && row.reason === "insufficient_families"));
+  assert(selection.withheld.some((row) => row.signal.symbol === "BTCUSDT"
+    && row.reason === "correlated_lower_rank"));
+});
+
+test("broadcast persists a trackable setup before sending and uses an injected live quote", async () => {
+  const order = [];
+  const sent = [];
+  const signal = { ...sampleSignal() };
+  const tracked = { id: "CR-BTC-20260808-999" };
+
+  const result = await broadcastSignal(signal, {
+    threshold: 0,
+    checkExecution: async (_signal, plan) => {
+      order.push("quote");
+      assert(plan && plan.r > 0);
+      return {
+        ok: true,
+        snapshot: {
+          known: true,
+          quoteTs: Date.now(),
+          costR: 0.1,
+          driftFractionOfR: 0.01,
+        },
+      };
+    },
+    outcomes: {
+      track() {
+        order.push("persist");
+        return tracked;
+      },
+    },
+    appendAlert() {
+      order.push("journal");
+    },
+    chatIds: ["group-1"],
+    async sendSignalAlert(chatId, _signal, text) {
+      order.push("send");
+      sent.push({ chatId, text });
+    },
+  });
+
+  assert.strictEqual(result, tracked);
+  assert.deepStrictEqual(order, ["quote", "persist", "journal", "send"]);
+  assert.strictEqual(sent.length, 1);
+  assert(sent[0].text.includes("CR-BTC-20260808-999"));
+  assert(Number.isFinite(signal.execution.costR), "the observed cost is stamped before persistence");
+});
+
 // ---------------------------------------------------------------------------
 // Buttons
 // ---------------------------------------------------------------------------
@@ -299,7 +394,9 @@ async function withTracker(fn, candles = []) {
   }
 }
 
-function trialSignal(symbol) {
+// Published alerts always carry the cohort that produced them, so a fixture
+// must too; `/results` is scoped to the active configuration by design.
+function trialSignal(symbol, overrides = {}) {
   return {
     exchange: "OKX",
     market: "futures",
@@ -310,6 +407,11 @@ function trialSignal(symbol) {
     stop: 90,
     time: "2026-08-08T11:59:00.000Z",
     confirmations: ["Bullish market structure"],
+    cohortId: activeCohortId(),
+    clusterId: `cluster-${symbol}`,
+    score: 80,
+    scoreBin: "80-89",
+    ...overrides,
   };
 }
 
@@ -335,10 +437,13 @@ test("results use plain labels and explain the t-statistic", async () => {
       "Final Profit Target (3:1)",
       "Average result after estimated trading costs",
       "Statistical confidence (t-statistic)",
+      "Independent market events",
+      "Settings fingerprint",
+      "Verdict",
     ]) {
       assert(text.includes(label), `results must report "${label}"`);
     }
-    assert(text.includes("A t-statistic above 2 is stronger evidence that the result may not be random."));
+    assert(text.includes("A t-statistic above 2 is stronger evidence that a result may not be random."));
     assert(text.includes("Estimated trading costs assumed"), "cost assumptions are disclosed");
     assertPlainLanguage(text, "the results summary");
   }, winner);

@@ -39,7 +39,12 @@ const path = require("path");
 const https = require("https");
 const telegramApi = require("node-telegram-bot-api");
 const TelegramBot = telegramApi.TelegramBot || telegramApi;
-const { buildTradePlan, createOutcomeTracker, DEFAULT_COSTS } = require("./outcomes");
+const outcomeModule = require("./outcomes");
+const { buildTradePlan, createOutcomeTracker, DEFAULT_COSTS } = outcomeModule;
+const strategy = require("./strategy");
+const execution = require("./execution");
+const shadowModule = require("./shadow");
+const { evidenceVerdict } = require("./stats");
 
 // Runtime ledgers can contain operational details. Keep every newly-created
 // file private even when the process manager itself was started with umask 022.
@@ -48,6 +53,9 @@ process.umask(0o077);
 loadLocalEnv(path.join(__dirname, ".env"));
 
 const BOT_NAME = "Consensus Reaper";
+// The frozen decision rules. Changing anything inside changes the strategy
+// hash and therefore starts a new research cohort.
+const STRATEGY = strategy.STRATEGY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const OWNER_ID = 7059352737;
 const DEFAULT_OWNER_CHAT_ID = 7059352737;
@@ -59,6 +67,11 @@ const STATE_FILE = path.join(__dirname, "state.json");
 const SIGNALS_FILE = path.join(__dirname, "signals.json");
 const ALERTS_FILE = path.join(__dirname, "alerts.json");
 const OUTCOMES_FILE = path.join(__dirname, "outcomes.json");
+const SHADOW_FILE = path.join(__dirname, "shadow-outcomes.json");
+// A cohort is only worth a verdict once it has this many INDEPENDENT market
+// events. Chosen as a sample-size floor, not from any observed result.
+const TRIAL_MIN_CLUSTERS = 50;
+const TRIAL_DAYS = 30;
 const RISK_REWARD_RATIO = 3;
 const SETUP_TIMEFRAME = "15m";
 const SETUP_TIMEFRAME_LABEL = "15 minutes";
@@ -111,6 +124,7 @@ const scheduledRun = process.argv.includes("--scheduled-run");
 // nothing polls Telegram and no token is needed.
 let bot = null;
 let outcomes = null;
+let shadow = null;
 
 // ---------------------------------------------------------------------------
 // State + env helpers
@@ -184,21 +198,38 @@ function loadLocalEnv(file) {
 }
 
 function loadJson(file, fallback) {
+  let raw;
   try {
-    const raw = fs.readFileSync(file, "utf8");
+    raw = fs.readFileSync(file, "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return fallback;
+    throw new Error(`Could not read private state file: ${file}`);
+  }
+  try {
     const parsed = JSON.parse(raw);
-    return parsed === undefined || parsed === null ? fallback : parsed;
+    if (parsed === undefined || parsed === null) throw new Error("empty");
+    return parsed;
   } catch {
-    return fallback;
+    throw new Error(`Private state file is not valid JSON: ${file}`);
   }
 }
 
 function saveJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  const fd = fs.openSync(tmp, "r");
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  fs.chmodSync(file, 0o600);
 }
 
 function appendJsonArray(file, item, maxItems = 500) {
   const rows = loadJson(file, []);
+  if (!Array.isArray(rows)) throw new Error(`Private history file did not contain an array: ${file}`);
   rows.unshift(item);
   saveJson(file, rows.slice(0, maxItems));
 }
@@ -522,13 +553,20 @@ function trendFromSwings(swings) {
 function nearestLevels(candles, swings, volatility) {
   const last = candles[candles.length - 1];
   const tolerance = Math.max(volatility * 0.75, last.close * 0.006);
-  const supports = swings.lows.map((s) => s.price).filter((p) => p <= last.close);
-  const resistances = swings.highs.map((s) => s.price).filter((p) => p >= last.close);
-  const support = supports.length ? Math.max(...supports) : Math.min(...candles.slice(-20).map((c) => c.low));
-  const resistance = resistances.length ? Math.min(...resistances) : Math.max(...candles.slice(-20).map((c) => c.high));
+  const supportSwing = swings.lows.filter((s) => s.price <= last.close)
+    .sort((a, b) => b.price - a.price)[0] || null;
+  const resistanceSwing = swings.highs.filter((s) => s.price >= last.close)
+    .sort((a, b) => a.price - b.price)[0] || null;
+  const recent = candles.slice(-20);
+  const supportFallback = recent.reduce((best, candle) => candle.low < best.low ? candle : best, recent[0]);
+  const resistanceFallback = recent.reduce((best, candle) => candle.high > best.high ? candle : best, recent[0]);
+  const support = supportSwing ? supportSwing.price : supportFallback.low;
+  const resistance = resistanceSwing ? resistanceSwing.price : resistanceFallback.high;
   return {
     support,
     resistance,
+    supportTime: supportSwing ? supportSwing.time : supportFallback.time,
+    resistanceTime: resistanceSwing ? resistanceSwing.time : resistanceFallback.time,
     nearSupport: support > 0 && Math.abs(last.close - support) <= tolerance,
     nearResistance: resistance > 0 && Math.abs(last.close - resistance) <= tolerance,
     tolerance,
@@ -540,8 +578,10 @@ function breakAndRetest(candles, swings, levels, volatility) {
   const recent = candles.slice(-12);
   const previousHighs = swings.highs.filter((s) => s.index < candles.length - 6).slice(-5);
   const previousLows = swings.lows.filter((s) => s.index < candles.length - 6).slice(-5);
-  const priorResistance = previousHighs.length ? Math.max(...previousHighs.map((s) => s.price)) : levels.resistance;
-  const priorSupport = previousLows.length ? Math.min(...previousLows.map((s) => s.price)) : levels.support;
+  const resistanceSwing = previousHighs.sort((a, b) => b.price - a.price)[0] || null;
+  const supportSwing = previousLows.sort((a, b) => a.price - b.price)[0] || null;
+  const priorResistance = resistanceSwing ? resistanceSwing.price : levels.resistance;
+  const priorSupport = supportSwing ? supportSwing.price : levels.support;
   const tolerance = Math.max(volatility * 0.9, last.close * 0.008);
 
   const brokeUp = priorResistance > 0 && recent.some((c) => c.close > priorResistance + tolerance * 0.2);
@@ -554,6 +594,8 @@ function breakAndRetest(candles, swings, levels, volatility) {
     short: retestedDown,
     longLevel: priorResistance,
     shortLevel: priorSupport,
+    longLevelTime: resistanceSwing ? resistanceSwing.time : levels.resistanceTime,
+    shortLevelTime: supportSwing ? supportSwing.time : levels.supportTime,
   };
 }
 
@@ -640,7 +682,6 @@ function analyzePair(pair, tf) {
   const long = scoreSide("long", baseCtx);
   const short = scoreSide("short", baseCtx);
   const winner = long.score >= short.score ? long : short;
-  if (winner.score < 45) return null;
 
   // Reject anything that cannot be published and monitored deterministically:
   // missing, non-finite, zero or directionally invalid entry/stop/target.
@@ -726,7 +767,6 @@ function scoreSide(side, ctx) {
   if (ctx.trendH1 === agreeWord) add(12, "1h trend aligned");
   if (ctx.trendM5 === agreeWord) add(6, "5m momentum aligned");
 
-  const rawScore = Math.min(100, score.reduce((sum, n) => sum + n, 0));
   const stop = long
     ? Math.max(0, Math.min(ctx.levels.support || last.close - ctx.volatility, last.close - ctx.volatility * 1.25))
     : Math.max(ctx.levels.resistance || last.close + ctx.volatility, last.close + ctx.volatility * 1.25);
@@ -739,24 +779,56 @@ function scoreSide(side, ctx) {
     : last.close - risk * RISK_REWARD_RATIO;
 
   confirmations.push(...reasons);
+
+  // Every observation, paired with its weight. The family-aware score is
+  // computed from these rather than by summing them, so several correlated
+  // descriptions of one price move cannot each add to the total.
+  const observations = reasons.map((label, i) => ({ label, points: score[i] }));
+  const evidence = strategy.scoreEvidence(observations, STRATEGY);
+
+  // The structural level that defines this thesis. Carried through so the
+  // thesis key is built from real level provenance, never from formatted text.
+  const thesisLevel = long
+    ? (ctx.retest.long ? ctx.retest.longLevel : ctx.levels.support)
+    : (ctx.retest.short ? ctx.retest.shortLevel : ctx.levels.resistance);
+  const thesisAnchorTime = long
+    ? (ctx.retest.long ? ctx.retest.longLevelTime : ctx.levels.supportTime)
+    : (ctx.retest.short ? ctx.retest.shortLevelTime : ctx.levels.resistanceTime);
+
   return {
     side,
-    score: Math.round(rawScore),
+    score: evidence.score,
+    rawFamilyScore: evidence.raw,
+    scoreDenominator: evidence.denominator,
+    familyCount: evidence.familyCount,
+    // The structural floor deliberately excludes publication-time execution:
+    // a cheap fresh quote can improve quality, but it cannot supply WHERE,
+    // WHAT-shape or WHY-now evidence that the chart thesis lacks.
+    thesisFamilyCount: evidence.familyCount,
+    evidence,
     price: last.close,
     stop,
     target,
+    thesisLevel,
+    thesisAnchorTime,
     riskRewardRatio: RISK_REWARD_RATIO,
     rsi: ctx.rsiValue,
     trend: ctx.trend,
     confirmations,
     // Kept for internal diagnostics and ranking, never shown in Telegram.
-    confirmationDetails: reasons.map((label, i) => ({ label, points: score[i] })),
+    confirmationDetails: observations,
     time: new Date(last.time).toISOString(),
   };
 }
 
-/** The three highest-weighted reasons, used for the "Why this setup" line. */
+/**
+ * The reader-facing reasons: the strongest observation from each of the top
+ * families, so three lines describe three genuinely different things.
+ */
 function topConfirmations(signal, count = 3) {
+  if (signal.evidence && Array.isArray(signal.evidence.winners) && signal.evidence.winners.length) {
+    return strategy.topReasons(signal.evidence, count);
+  }
   const details = Array.isArray(signal.confirmationDetails) ? signal.confirmationDetails : null;
   if (details && details.length) {
     return details.slice()
@@ -771,10 +843,22 @@ function topConfirmations(signal, count = 3) {
 // Scan loop
 // ---------------------------------------------------------------------------
 
+/** Cohort identity for everything published by the current configuration. */
+function activeCohortId() {
+  return strategy.cohortId({
+    strategy: STRATEGY,
+    threshold: state.alertThreshold,
+    useHtfGate: state.useHtfGate,
+    pairs: state.pairs,
+    costs: { feeRatePerSide: state.feeRatePerSide, slippageRatePerSide: state.slippageRatePerSide },
+  });
+}
+
 async function scanMarkets(manual = false) {
   const started = Date.now();
   const signals = [];
   const errors = [];
+  const reads = [];
   let liveDataPairs = 0;
 
   for (const pair of state.pairs) {
@@ -789,6 +873,13 @@ async function scanMarkets(manual = false) {
         continue;
       }
       liveDataPairs += 1;
+      // Breadth is computed from every usable pair, not only the ones that
+      // produced a signal, so it describes the market rather than the alerts.
+      reads.push({
+        symbol: pair.api,
+        trend: timeframeTrend(c15),
+        trendH1: timeframeTrend(c1h),
+      });
       const signal = analyzePair(pair, { "15m": c15, "5m": c5, "1h": c1h });
       if (signal) signals.push(signal);
     } catch (err) {
@@ -797,9 +888,31 @@ async function scanMarkets(manual = false) {
     await sleep(250);
   }
 
+  const context = strategy.marketContext(reads, STRATEGY);
+  const cohort = activeCohortId();
+
+  // Stamp identity on every candidate before any filtering, so shadow records
+  // carry the same provenance as published ones.
+  for (const signal of signals) {
+    signal.cohortId = cohort;
+    signal.strategyHash = strategy.strategyHash(STRATEGY);
+    signal.strategyVersion = STRATEGY.version;
+    signal.universeHash = strategy.universeHash(state.pairs);
+    signal.thresholdAtAlert = state.alertThreshold;
+    signal.context = context;
+    signal.regime = strategy.pairRegime(signal);
+    signal.scoreBin = strategy.scoreBin(signal.score);
+    signal.clusterId = strategy.clusterKey(signal, context, STRATEGY);
+    signal.thesisKey = strategy.thesisKey(signal, STRATEGY);
+  }
+
   signals.sort((a, b) => b.score - a.score);
-  const accepted = signals.filter((s) => s.score >= state.alertThreshold);
-  const fresh = accepted.filter((s) => !isCoolingDown(s));
+  const selection = await selectPublishableCandidates(signals, context);
+  const accepted = selection.accepted;
+  const fresh = selection.fresh;
+  const withheld = selection.withheld;
+  const clusters = selection.clusters;
+  errors.push(...selection.errors);
 
   const summary = {
     scannedAt: new Date().toISOString(),
@@ -810,6 +923,10 @@ async function scanMarkets(manual = false) {
     candidates: signals.length,
     accepted: accepted.length,
     fresh: fresh.length,
+    withheld: withheld.length,
+    clusters: clusters.size,
+    cohortId: cohort,
+    context,
     errors,
     top: signals.slice(0, 10),
   };
@@ -818,10 +935,13 @@ async function scanMarkets(manual = false) {
   if (dryRun) {
     printDryRun(summary);
   } else if (!state.paused) {
-    for (const signal of fresh) {
-      await broadcastSignal(signal);
-      markCooldown(signal);
+    for (const item of fresh) {
+      const record = await broadcastSignal(item.signal, { prepared: item.prepared });
+      if (record) markCooldown(item.signal);
       await sleep(750);
+    }
+    for (const item of withheld) {
+      await recordShadow(item.signal, [item.reason], item.execution || null);
     }
     saveJson(STATE_FILE, state);
   }
@@ -853,19 +973,196 @@ function markCooldown(signal) {
   state.lastAlerts[cooldownKey(signal)] = Date.now();
 }
 
-async function broadcastSignal(signal) {
+/**
+ * True while an earlier setup expressing the same thesis is still unresolved.
+ *
+ * The 30-minute cooldown alone was not enough: as candles advance, the same
+ * structural idea re-qualifies under a new signal time and is published again.
+ * A thesis is released once its earlier setup reaches a terminal state, or when
+ * a genuinely different structural level produces a different key.
+ */
+function hasOpenThesis(signal) {
+  if (!outcomes || !signal.thesisKey) return false;
+  return outcomes.records.some((record) => record.thesisKey === signal.thesisKey
+    && !strategy.thesisIsSettled(record));
+}
+
+/** Journal a withheld-but-valid candidate. Never sends anything. */
+async function recordShadow(signal, reasons, executionSnapshot = null) {
+  if (!shadow) return null;
+  const plan = buildTradePlan(signal);
+  if (!plan) return null; // Never shadow a setup we could not have measured.
+  return shadow.track({
+    signal,
+    plan,
+    baseId: outcomeModule.makeAlertId(signal, shadow.records),
+    sentAt: new Date().toISOString(),
+    costs: {
+      feeRatePerSide: state.feeRatePerSide,
+      slippageRatePerSide: state.slippageRatePerSide,
+    },
+    reasons,
+    context: signal.context,
+    evidence: signal.evidence,
+    execution: executionSnapshot,
+  });
+}
+
+/**
+ * Take a fresh public execution snapshot for one candidate.
+ *
+ * Returns `{ ok }` with the snapshot, or a typed refusal. A data failure is a
+ * refusal to publish, never a fabricated price and never a losing outcome.
+ */
+async function checkExecution(signal, plan, getJson = httpGetJson) {
+  const quote = await execution.fetchQuote(okxInstId({ api: signal.symbol, market: signal.market }), getJson);
+  if (!quote.ok) return { ok: false, reason: quote.reason, snapshot: null };
+  return execution.evaluateExecution({
+    signal,
+    plan,
+    quote: quote.quote,
+    now: Date.now(),
+    strategy: STRATEGY,
+    costs: {
+      feeRatePerSide: state.feeRatePerSide,
+      slippageRatePerSide: state.slippageRatePerSide,
+    },
+  });
+}
+
+/**
+ * Attach the publication-time quote and recompute the final score.
+ * Pure apart from the injected quote check; it never persists or notifies.
+ */
+async function prepareSignalExecution(signal, checker = checkExecution, threshold = state.alertThreshold) {
+  const plan = buildTradePlan(signal);
+  if (!plan) return { ok: false, reason: "invalid_plan", snapshot: null, plan: null };
+
+  const exec = await checker(signal, plan);
+  if (!exec.ok) return { ...exec, plan };
+
+  // Execution quality is real evidence, so it re-scores the setup in its own
+  // family. A setup that only cleared the threshold on paper can fall below it
+  // once the true cost of trading it is included.
+  const withExecution = strategy.scoreEvidence(
+    [...(signal.confirmationDetails || []), ...execution.executionObservations(exec.snapshot, STRATEGY)],
+    STRATEGY,
+  );
+  signal.evidence = withExecution;
+  signal.score = withExecution.score;
+  signal.familyCount = withExecution.familyCount;
+  signal.scoreBin = strategy.scoreBin(withExecution.score);
+  signal.execution = exec.snapshot;
+  signal.costR = exec.snapshot.costR;
+
+  if (signal.score < threshold) {
+    return {
+      ok: false,
+      reason: shadowModule.SHADOW_REASONS.BELOW_THRESHOLD,
+      snapshot: exec.snapshot,
+      plan,
+    };
+  }
+  return { ok: true, snapshot: exec.snapshot, plan };
+}
+
+/**
+ * Apply the publication gates and cluster cap to one scan's valid plans.
+ * Extracted so the complete gate-to-shadow wiring is deterministic in tests.
+ */
+async function selectPublishableCandidates(signals, context, dependencies = {}) {
+  const cooling = dependencies.isCoolingDown || isCoolingDown;
+  const openThesis = dependencies.hasOpenThesis || hasOpenThesis;
+  const prepare = dependencies.prepareSignalExecution || prepareSignalExecution;
+  const threshold = Number.isFinite(dependencies.threshold)
+    ? dependencies.threshold
+    : state.alertThreshold;
+  const withheld = [];
+  const ready = [];
+  const errors = [];
+
+  for (const signal of signals) {
+    if (cooling(signal)) continue; // Operational rate limiter, not gate evidence.
+    const thesisFamilies = Number.isFinite(signal.thesisFamilyCount)
+      ? signal.thesisFamilyCount
+      : signal.familyCount;
+    if (thesisFamilies < STRATEGY.minFamilies) {
+      withheld.push({ signal, reason: shadowModule.SHADOW_REASONS.INSUFFICIENT_FAMILIES });
+      continue;
+    }
+    if (openThesis(signal)) {
+      withheld.push({ signal, reason: shadowModule.SHADOW_REASONS.DUPLICATE_THESIS });
+      continue;
+    }
+    if (strategy.contradictsRegime(signal.side, context, STRATEGY)) {
+      withheld.push({ signal, reason: shadowModule.SHADOW_REASONS.REGIME_CONTRADICTION });
+      continue;
+    }
+
+    const prepared = await prepare(signal, checkExecution, threshold);
+    if (!prepared.ok) {
+      if (shadowModule.isShadowable(prepared.reason)) {
+        withheld.push({ signal, reason: prepared.reason, execution: prepared.snapshot || null });
+      } else {
+        errors.push(`${signal.symbol}: execution refused (${prepared.reason})`);
+      }
+      continue;
+    }
+    ready.push({ signal, prepared });
+  }
+
+  // Execution is measured before ranking, so the documented lower-cost
+  // tie-break is real rather than an always-missing field.
+  const clusters = new Map();
+  for (const item of ready) {
+    if (!clusters.has(item.signal.clusterId)) clusters.set(item.signal.clusterId, []);
+    clusters.get(item.signal.clusterId).push(item);
+  }
+  const fresh = [];
+  for (const group of clusters.values()) {
+    const rankedSignals = strategy.rankCandidates(group.map((item) => item.signal));
+    const bySignal = new Map(group.map((item) => [item.signal, item]));
+    fresh.push(...rankedSignals.slice(0, STRATEGY.publication.maxPerCluster).map((s) => bySignal.get(s)));
+    for (const loser of rankedSignals.slice(STRATEGY.publication.maxPerCluster)) {
+      withheld.push({
+        signal: loser,
+        reason: shadowModule.SHADOW_REASONS.CORRELATED_LOWER_RANK,
+        execution: loser.execution || null,
+      });
+    }
+  }
+
+  return { accepted: ready.map((item) => item.signal), fresh, withheld, clusters, errors };
+}
+
+async function broadcastSignal(signal, options = {}) {
+  const prepared = options.prepared
+    || await prepareSignalExecution(signal, options.checkExecution || checkExecution, options.threshold);
+  if (!prepared.ok) {
+    if (shadowModule.isShadowable(prepared.reason)) {
+      await (options.recordShadow || recordShadow)(signal, [prepared.reason], prepared.snapshot);
+    } else {
+      (options.logger || console).error(`execution refused ${signal.symbol}: ${prepared.reason}`);
+    }
+    return null;
+  }
+
   const sentAt = new Date().toISOString();
-  const record = outcomes ? outcomes.track(signal, sentAt) : null;
-  if (outcomes && !record) {
+  const tracker = options.outcomes === undefined ? outcomes : options.outcomes;
+  const record = tracker ? tracker.track(signal, sentAt) : null;
+  if (tracker && !record) {
     // buildTradePlan already logged the reason. Never publish a setup we cannot
     // measure: an untrackable alert would pollute the trial.
     return null;
   }
   const alertId = record ? record.id : null;
   const text = formatSignal(signal, alertId);
-  appendJsonArray(ALERTS_FILE, { sentAt, alertId, chatIds: state.alertChatIds, signal }, 500);
-  for (const chatId of state.alertChatIds) {
-    await sendSignalAlert(chatId, signal, text);
+  const chatIds = options.chatIds || state.alertChatIds;
+  const appendAlert = options.appendAlert || ((row) => appendJsonArray(ALERTS_FILE, row, 500));
+  appendAlert({ sentAt, alertId, chatIds, signal });
+  const sender = options.sendSignalAlert || sendSignalAlert;
+  for (const chatId of chatIds) {
+    await sender(chatId, signal, text);
   }
   return record;
 }
@@ -1014,9 +1311,6 @@ function statusText() {
 // Trial results
 // ---------------------------------------------------------------------------
 
-const TRIAL_MIN_SETUPS = 50;
-const TRIAL_DAYS = 30;
-
 function fmtDay(iso) {
   if (!iso) return "not started";
   return new Date(iso).toISOString().slice(0, 10);
@@ -1027,41 +1321,126 @@ function fmtR(value) {
   return `${n >= 0 ? "+" : ""}${n.toFixed(3)}`;
 }
 
-function legText(title, leg) {
+/**
+ * One leg, reported with BOTH sample sizes.
+ *
+ * The success rate and expectancy describe every published setup. The
+ * t-statistic is quoted only on the market-event series, because ten correlated
+ * alerts from one sell-off are one piece of evidence, not ten.
+ */
+function legText(title, leg, stats) {
   if (!leg.resolved) return `<b>${title}</b>\nNo completed setups yet.`;
+  const t = stats.tStatistic === null ? "not enough independent data" : stats.tStatistic.toFixed(2);
   return `<b>${title}</b>\n` +
     `Target hits: <b>${leg.tp}</b>\n` +
     `Stop losses: <b>${leg.sl}</b>\n` +
     `Success rate: <b>${leg.winRate.toFixed(1)}%</b>\n` +
     `Average result after estimated trading costs: <b>${fmtR(leg.netExpectancyR)}</b> times the amount risked\n` +
-    `Statistical confidence (t-statistic): <b>${leg.tStat === null ? "not enough data" : leg.tStat.toFixed(2)}</b>`;
+    `Independent market events: <b>${stats.clusterCount}</b> (from ${stats.rawCount} setups)\n` +
+    `Average per market event: <b>${fmtR(stats.clusterNetExpectancyR)}</b>\n` +
+    `Statistical confidence (t-statistic): <b>${t}</b>`;
 }
 
 function resultsText(tracker = outcomes) {
   if (!tracker) return `<b>${BOT_NAME}</b>\n\nOutcome monitoring is not running.`;
-  const s = tracker.summary();
+  const cohort = activeCohortId();
+  const s = tracker.summary({ cohortId: cohort });
   const costPct = ((s.costs.feeRatePerSide + s.costs.slippageRatePerSide) * 2 * 100).toFixed(2);
   const days = s.firstAlertAt
     ? Math.floor((Date.now() - Date.parse(s.firstAlertAt)) / 86400000) + 1
     : 0;
 
+  const requirement = { minClusters: TRIAL_MIN_CLUSTERS, minTStat: 2 };
+  const oneVerdict = evidenceVerdict(s.oneRStats, requirement);
+  const threeVerdict = evidenceVerdict(s.threeRStats, requirement);
+
   return `<b>${BOT_NAME} — Results</b>\n\n` +
+    `Settings fingerprint: <code>${esc(cohort)}</code>\n` +
+    `Alert threshold: <b>${state.alertThreshold}</b>\n` +
     `Trial period: <b>${fmtDay(s.firstAlertAt)}</b> to <b>${fmtDay(s.lastAlertAt)}</b>\n` +
-    `Day <b>${days}</b> of <b>${TRIAL_DAYS}</b>, <b>${s.completed}</b> of <b>${TRIAL_MIN_SETUPS}</b> completed setups\n\n` +
+    `Day <b>${days}</b> of <b>${TRIAL_DAYS}</b>\n\n` +
     `Total alerts published: <b>${s.total}</b>\n` +
+    `Independent market events: <b>${s.clusters}</b> of <b>${TRIAL_MIN_CLUSTERS}</b> needed\n` +
     `Awaiting Entry Price: <b>${s.awaitingEntry}</b>\n` +
     `Entered and still being monitored: <b>${s.enteredMonitoring}</b>\n` +
     `Cancelled before entry: <b>${s.cancelled}</b>\n` +
     `Expired before entry: <b>${s.expiredBeforeEntry}</b>\n` +
     `Expired after entry: <b>${s.expiredAfterEntry}</b>\n` +
     `Completed setups: <b>${s.completed}</b>\n\n` +
-    `${legText("First Profit Target (1:1)", s.oneR)}\n\n` +
-    `${legText("Final Profit Target (3:1)", s.threeR)}\n\n` +
-    `<i>A t-statistic above 2 is stronger evidence that the result may not be random.</i>\n\n` +
+    `${legText("First Profit Target (1:1)", s.oneR, s.oneRStats)}\n` +
+    `Verdict: <b>${oneVerdict.verdict}</b>\n\n` +
+    `${legText("Final Profit Target (3:1)", s.threeR, s.threeRStats)}\n` +
+    `Verdict: <b>${threeVerdict.verdict}</b>\n\n` +
+    `<i>Several alerts from one market move count as one piece of evidence. ` +
+    `A t-statistic above 2 is stronger evidence that a result may not be random.</i>\n\n` +
     `Estimated trading costs assumed: <b>${costPct}%</b> per completed setup ` +
-    `(${(s.costs.feeRatePerSide * 100).toFixed(3)}% fee and ${(s.costs.slippageRatePerSide * 100).toFixed(3)}% slippage on entry and exit).\n` +
+    `(${(s.costs.feeRatePerSide * 100).toFixed(3)}% fee and ${(s.costs.slippageRatePerSide * 100).toFixed(3)}% slippage on entry and exit), ` +
+    `plus the spread observed at publication.\n` +
     `Setups expire after <b>${s.expiryHours} hours</b> without a result.` +
-    (s.dataGaps ? `\nSetups with incomplete monitoring data: <b>${s.dataGaps}</b>` : "");
+    (s.dataGaps ? `\nSetups with incomplete monitoring data: <b>${s.dataGaps}</b>` : "") +
+    (s.legacyCount ? `\n\n<i>${s.legacyCount} older alert(s) were published under an unknown ` +
+      `configuration and are excluded from the figures above.</i>` : "");
+}
+
+/**
+ * Owner-only detail: score bins and, when asked, every cohort separately.
+ * Cohorts are always labelled and never merged.
+ */
+function detailedResultsText(tracker = outcomes) {
+  if (!tracker) return `<b>${BOT_NAME}</b>\n\nOutcome monitoring is not running.`;
+  const cohort = activeCohortId();
+  const s = tracker.summary({ cohortId: cohort });
+
+  const binLines = strategy.SCORE_BINS.map((bin) => {
+    const row = s.scoreBins[bin.id];
+    if (!row || !row.total) return `${bin.label}: none`;
+    const one = row.oneR;
+    const rate = one.rawCount ? `${((one.wins / one.rawCount) * 100).toFixed(0)}%` : "no result";
+    return `${bin.label}: <b>${row.total}</b> setups, first target ${rate}, ` +
+      `${fmtR(one.clusterNetExpectancyR)} per market event`;
+  }).join("\n");
+
+  const cohortLines = tracker.summaryAllCohorts
+    ? tracker.summaryAllCohorts().map((c) => {
+      const label = c.cohortId === strategy.LEGACY_COHORT_ID
+        ? "legacy / unknown configuration"
+        : c.cohortId;
+      return `<code>${esc(label)}</code>: ${c.total} alerts, ${c.clusters} market events, ` +
+        `${c.completed} completed`;
+    }).join("\n")
+    : "unavailable";
+
+  return `<b>${BOT_NAME} — Detailed results</b>\n\n` +
+    `Active settings fingerprint: <code>${esc(cohort)}</code>\n\n` +
+    `<b>By setup quality score</b>\n${binLines}\n\n` +
+    `<b>All configurations, reported separately</b>\n${cohortLines}\n\n` +
+    `<i>Different configurations are never combined. Each one is its own trial.</i>`;
+}
+
+/** Owner-only shadow research view. Shadow setups were never sent to anyone. */
+function shadowResultsText(ledger = shadow) {
+  if (!ledger) return `<b>${BOT_NAME}</b>\n\nShadow research tracking is not running.`;
+  const byReason = shadowModule.summariseByReason(
+    ledger.records,
+    (rows, field, multiple) => require("./stats").legStatistics(
+      outcomeModule.legSamples(rows, field, multiple),
+    ),
+  );
+  const entries = Object.values(byReason);
+  if (!entries.length) {
+    return `<b>${BOT_NAME} — Withheld setups</b>\n\nNothing has been withheld yet.`;
+  }
+  const lines = entries.map((row) => {
+    const one = row.oneR;
+    return `<b>${esc(row.reason)}</b>\n` +
+      `Withheld: ${row.total}, completed: ${row.completed}\n` +
+      `First target: ${one.wins} reached / ${one.losses} stopped, ` +
+      `${fmtR(one.clusterNetExpectancyR)} per market event`;
+  }).join("\n\n");
+
+  return `<b>${BOT_NAME} — Withheld setups</b>\n\n` +
+    `These setups were never sent to anyone. They are measured only to check ` +
+    `whether the rule that withheld them is helping.\n\n${lines}`;
 }
 
 function commandPattern(command) {
@@ -1209,6 +1588,16 @@ function registerCommands() {
     sendHtml(msg.chat.id, resultsText());
   });
 
+  bot.onText(commandPattern("detail"), (msg) => {
+    if (!ownerGuard(msg)) return;
+    sendHtml(msg.chat.id, detailedResultsText());
+  });
+
+  bot.onText(commandPattern("withheld"), (msg) => {
+    if (!ownerGuard(msg)) return;
+    sendHtml(msg.chat.id, shadowResultsText());
+  });
+
   bot.onText(commandPattern("pause"), (msg) => {
     if (!ownerGuard(msg)) return;
     state.paused = true;
@@ -1351,6 +1740,10 @@ async function handleScheduledMessage(msg) {
     await sendHtml(chatId, statusText());
   } else if (command.name === "results") {
     await ownerOnly(() => sendHtml(chatId, resultsText()));
+  } else if (command.name === "detail") {
+    await ownerOnly(() => sendHtml(chatId, detailedResultsText()));
+  } else if (command.name === "withheld") {
+    await ownerOnly(() => sendHtml(chatId, shadowResultsText()));
   } else if (command.name === "pause") {
     await ownerOnly(async () => {
       state.paused = true;
@@ -1420,6 +1813,21 @@ function createTracker() {
 }
 
 /**
+ * The shadow ledger reuses the published state machine, so withheld setups are
+ * measured by exactly the same rules. It has no notifier: nothing here can ever
+ * reach Telegram.
+ */
+function createShadow() {
+  return shadowModule.createShadowLedger({
+    file: SHADOW_FILE,
+    createRecord: outcomeModule.createRecord,
+    applyCandles: outcomeModule.applyCandles,
+    fetchCandles: (pair, frame, limit) => fetchCandles(pair, frame, limit),
+    expiryMs: Number(state.outcomeExpiryHours) * 3600 * 1000,
+  });
+}
+
+/**
  * Resolve published setups against closed OKX 1m candles. Runs independently of
  * the scan loop so outcomes land promptly, and survives its own failures: a
  * monitoring error is logged, never turned into a result.
@@ -1428,6 +1836,7 @@ async function monitorLoop() {
   while (true) {
     try {
       await outcomes.poll();
+      await shadow.poll();
     } catch (err) {
       console.error("Outcome monitoring failed:", err.message);
     }
@@ -1454,6 +1863,7 @@ async function scheduledMain() {
 
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
   outcomes = createTracker();
+  shadow = createShadow();
 
   let commands = { forceScan: false, scanChatIds: [], processed: 0 };
   try {
@@ -1467,6 +1877,7 @@ async function scheduledMain() {
   let outcomeEvents = [];
   try {
     outcomeEvents = await outcomes.poll();
+    await shadow.poll();
   } catch (err) {
     console.error("Scheduled outcome monitoring failed:", err.message);
   }
@@ -1517,6 +1928,7 @@ async function main() {
   }
   bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: !sendTest });
   outcomes = createTracker();
+  shadow = createShadow();
 
   if (sendTest) {
     const signal = sampleSignal();
@@ -1553,17 +1965,26 @@ if (require.main === module) {
 // Exported for the test suites. Requiring this file starts nothing.
 module.exports = {
   BOT_NAME,
+  activeCohortId,
   analyzePair,
+  broadcastSignal,
+  checkExecution,
+  createShadow,
   createTracker,
+  detailedResultsText,
+  hasOpenThesis,
   directionWords,
   formatOutcome,
   formatSignal,
   helpText,
   resultsText,
   sampleSignal,
+  shadowResultsText,
   parseTelegramCommand,
+  prepareSignalExecution,
   scheduledMain,
   scheduledScanDue,
   signalButtons,
+  selectPublishableCandidates,
   topConfirmations,
 };

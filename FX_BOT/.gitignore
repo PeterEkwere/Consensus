@@ -5,6 +5,16 @@ __pycache__/
 .DS_Store
 data_cache/
 reports/
-state/*.db
 .pytest_cache/
 .claude/
+
+# Node runtime
+node_modules/
+
+# Runtime state and research journals. Never tracked: these contain live
+# operational detail and would make the repo a moving target.
+state/
+state/*.json
+state/*.json.tmp
+state/.*.tmp
+*.jsonl

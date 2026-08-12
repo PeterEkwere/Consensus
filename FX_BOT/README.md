@@ -1,25 +1,171 @@
-# Scalp Bot — SMC Scalping Signal Engine + FundingPips Backtester
+# Consensus FX Sentinel
 
-An engineering/research system that (eventually) can:
+> ## ⚠️ Status: no FX edge has been demonstrated in this repository
+>
+> The legacy Python strategy in this directory **lost money** in its only real-data
+> run. January–June 2025 produced roughly **1,225 trades, a 34% win rate, -0.309
+> average R, a 0.58 profit factor, a simulated loss of about $189,210, and zero
+> passes across 25 walk-forward runs.**
+>
+> Wins on synthetic data prove plumbing, not markets. No report in `reports/` may
+> be described as evidence of profitability, and no historical result here may be
+> used to justify enabling live trade-style alerts.
+>
+> The Node runtime under `runtime/` is a **measurement instrument** for six new
+> candidate playbooks. It starts in research mode and stays there. Coding an idea
+> does not make it a strategy.
 
-1. Backtest a Smart-Money-Concepts / price-action scalping strategy **without look-ahead**.
-2. Simulate FundingPips challenge rules before any live use.
-3. Run a live Telegram **alert-only** bot (it never places orders).
+An alert-only foreign-exchange setup finder and outcome-measurement bot. It never
+logs into a trading account, places an order, copies a trade, reads a balance, or
+claims that a reader made or lost money. This is not financial advice.
 
-This is not financial advice. The strategy must be proven in simulation before the
-live alert bot is built. Full design: [`docs/SCALPING_SIGNAL_BOT_ARCHITECTURE.md`](docs/SCALPING_SIGNAL_BOT_ARCHITECTURE.md).
+## Two code bases, one purpose
 
-## Status
+| | `runtime/` (Node 22) | Python packages |
+|---|---|---|
+| Role | Live/research scanner **and** canonical replay | Legacy research archive |
+| Status | Current work | Frozen except for correctness repairs |
+| Strategy | Six candidate playbooks (P1–P6) | The losing scalping state machine |
 
-- **Phase 1 — Battle-tested architecture: ✅ complete.**
-  `config/`, `domain/`, `signal_engine/` (pure state machine) and the Phase-1 unit
-  test suite are implemented and green.
-- **Phase 2 — Data extraction + backtest: ✅ complete (runs on synthetic data).**
-  `data/`, `backtest/`, and the `scripts/` pipeline run end-to-end and write
-  reports. See [Phase 2](#phase-2--backtest-pipeline) — including an important
-  honesty note: the demo runs on **synthetic** data because MT5 is unavailable here,
-  so the pass rates prove the *pipeline*, not the *strategy*.
-- Phase 3 (live scanner + guardrail + Telegram) is not started.
+`runtime/engine.js` and `runtime/playbooks.js` are the **single canonical strategy
+implementation**. Both the live scanner and `runtime/backtest.js` call them, so the
+replay cannot drift away from the bot it validates. The six playbooks are
+deliberately **not** reimplemented in Python.
+
+## The Node runtime
+
+```bash
+npm --prefix FX_BOT test        # deterministic suite, no network, no secrets
+npm --prefix FX_BOT run check   # syntax check
+node FX_BOT/runtime/bot.js --dry-run --fixtures   # offline pipeline proof
+```
+
+CLI modes:
+
+| Command | Behaviour |
+|---|---|
+| `--dry-run --fixtures` | Deterministic offline scan. No secrets, sends nothing. |
+| `--dry-run` | Real provider fetch and candidate summary. Sends nothing, persists nothing. |
+| `--send-test` | One unmistakable non-market test message. |
+| `--once` | One research scan plus one outcome pass. |
+| *(no flag)* | Long-running scanner and Telegram poller. |
+
+A dry run reports candle counts and the latest complete candle per instrument, and
+**exits nonzero if every instrument failed to return data**. Zero candidates never
+implies the feed worked.
+
+### How a setup is measured
+
+```text
+R           = abs(entry - stop)
+firstTarget = entry + directionSign * R        (1:1)
+finalTarget = entry + directionSign * 3 * R    (3:1)
+```
+
+The 1:1 and 3:1 legs are tracked **independently against the original stop** and
+reported separately. There is deliberately no blended "strategy win rate": the
+first leg risks 1 to make 1, the final leg risks 1 to make 3, and averaging them
+would describe a trade nobody took.
+
+Outcome rules, applied to closed Tiingo one-minute OHLC candles:
+
+- Only candles whose **open time is at or after the alert was sent** are eligible.
+  A candle that opened before the alert is never used, even if it closed after.
+- Entry activates when `low <= entry <= high`.
+- The stop reached **without the entry being touched at all** cancels the setup
+  before entry; it is not scored.
+- One candle containing both entry and stop counts as entered and then stopped.
+- **Stop-first ambiguity rule:** a single OHLC bar cannot reveal the order of
+  events, so any candle holding both the stop and an unresolved target records the
+  stop. This understates performance rather than inventing wins.
+- Unresolved setups expire after 24 hours and are reported separately, never as a
+  win or a loss.
+- A failed data fetch increments a gap counter and resolves nothing.
+
+Costs are recorded at alert time as `observedSpread + 2*slippage + commission`,
+converted to R. **When the spread was never observed, cost is unknown — never
+zero** — and such a plan cannot graduate out of research mode.
+
+Every candidate carries a `configHash` of the frozen tuning, active universe,
+scan cadence, outcome expiry and alert mode that produced it. Changing any of
+those decisions starts a new cohort instead of rewriting earlier results;
+reordering the same instruments does not.
+
+### Research and promotion
+
+Each playbook keeps its own cohort. Before anyone considers promoting one, the
+report must show a genuinely out-of-sample real-data period, a useful number of
+completed non-duplicate examples, net expectancy after observed costs, the
+t-statistic and sample size, stability across instruments and sessions, behaviour
+under higher cost assumptions, and prospective frozen-config results collected
+without retuning.
+
+There is **no automatic promotion switch**, and no playbook is hard-coded as
+proven. A losing playbook should be disabled, not optimised until the same history
+finally looks favourable.
+
+### Known gaps
+
+- A controlled live dry run on 2026-08-09 authenticated to Tiingo and returned
+  current top-of-book plus complete M1/M5/M15/H1 histories for all four configured
+  instruments. It produced no candidate and sent/persisted nothing. This proves
+  the provider path works; it does not prove an edge.
+- The live runtime uses read-only Tiingo Forex REST data: one batched
+  top-of-book request for current bid/ask plus four historical candle requests
+  per instrument. It does not use the high-volume WebSocket firehose because a
+  closed-candle strategy gains no decision quality from microsecond updates.
+- One four-instrument scan uses 17 requests. The default 30-minute interval is
+  therefore 34 requests/hour and 816/day, leaving headroom under the documented
+  Tiingo Free limits of 50/hour and 1,000/day. Manual `/scan` requests are
+  cadence-limited and replace, rather than add to, a scheduled provider pass.
+- Outcome checks reuse each scan's one-minute candles. A target or stop is still
+  evaluated at one-minute resolution, but its Telegram notification can arrive
+  up to one scan interval later.
+- A new alert requires a top-of-book quote no older than 15 minutes. This blocks
+  stale weekend and feed-outage setups.
+- **There is no authenticated news provider.** News status is `unknown`; alerts say
+  so explicitly and a playbook cannot reach normal alert mode while it stays
+  unknown. The runtime never claims a news filter passed.
+- No forward research period has been collected yet.
+
+## Legacy Python archive
+
+The Python packages remain for audit and history. Only correctness repairs were
+made; the strategy was not re-tuned.
+
+**Repaired:** the replay could previously discover a signal at a candle's close and
+then fill the entry *inside that same candle*. Signals are now queued and the
+earliest candle that may fill one is the **next** candle, which must actually trade
+through the entry price. A candle reaching the stop without touching the entry
+cancels the setup. See `tests/test_replay_entry_timing.py`.
+
+**Not repaired, and still true of any report in `reports/`:**
+
+- position sizing risks a fraction of the **initial** balance, not the running
+  balance, so the equity path is not a faithful sequential simulation;
+- portfolio concurrency is applied after per-symbol replay rather than during it;
+- the prop-challenge simulator runs with an **empty news calendar**;
+- several documented trend/session/momentum/quality filters are not actually wired
+  into the setup decision.
+
+The prop simulator is therefore **quarantined as legacy research** until a separate
+task repairs and validates the full portfolio chronology.
+
+`scripts/run_backtest.py` now defaults to the `default` strategy profile;
+`--strategy-profile synthetic` still works but prints an unmistakable warning that
+its results measure plumbing only.
+
+Full legacy design notes: [`docs/SCALPING_SIGNAL_BOT_ARCHITECTURE.md`](docs/SCALPING_SIGNAL_BOT_ARCHITECTURE.md).
+
+## Legacy phase notes
+
+- **Phase 1 — architecture.** `config/`, `domain/`, `signal_engine/` and their unit
+  tests are implemented and green.
+- **Phase 2 — data extraction + backtest.** `data/`, `backtest/` and `scripts/` run
+  end-to-end and write reports. The demo runs on **synthetic** data because MT5 is
+  unavailable here, so its pass rates prove the *pipeline*, not the *strategy*.
+- Phase 3 (the live Python scanner) was never started and has been superseded by
+  the Node runtime above.
 
 ## Phase 2 — backtest pipeline
 
